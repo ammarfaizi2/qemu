@@ -2,6 +2,7 @@
 #define OR_LOGGER_H
 
 #include <stdarg.h>
+#include <stdio.h>
 
 /*
  * or_log() behaves like printf(), but writes its output to a log file
@@ -19,5 +20,7 @@ void or_log(const char *fmt, ...)
     __attribute__((format(printf, 1, 2)))
 #endif
     ;
+
+FILE *or_log_get_fp(void);
 
 #endif /* OR_LOGGER_H */

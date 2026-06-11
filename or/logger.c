@@ -73,3 +73,9 @@ void or_log(const char *fmt, ...)
 
     qemu_mutex_unlock(&or_log_mutex);
 }
+
+FILE *or_log_get_fp(void)
+{
+    or_log_open_locked();
+    return or_log_fp;
+}
