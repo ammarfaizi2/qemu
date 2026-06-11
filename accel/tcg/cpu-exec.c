@@ -930,6 +930,37 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 #endif
 }
 
+
+struct or_qemu_regs_x86_64 {
+    uint64_t rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi;
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+
+    // APX eGPR.
+    uint64_t r16, r17, r18, r19, r20, r21, r22, r23;
+    uint64_t r24, r25, r26, r27, r28, r29, r30, r31;
+
+    uint64_t rip;
+    uint64_t rflags;
+};
+
+void or_intercept_cpu_arch_state(int cpu_index, struct or_qemu_regs_x86_64 *regs);
+
+void or_intercept_cpu_arch_state(int cpu_index, struct or_qemu_regs_x86_64 *regs)
+{
+    __asm__ volatile (
+        ""
+        :
+        : "r"(regs), "r"(cpu_index)
+        : "memory");
+}
+
+static void __intercept_cpu_arch_state(CPUState *cpu)
+{
+    CPUArchState *env = cpu_env(cpu);
+    struct or_qemu_regs_x86_64 *regs = (void *)env;
+    or_intercept_cpu_arch_state(cpu->cpu_index, regs);
+}
+
 /* main execution loop */
 
 static int __attribute__((noinline))
@@ -946,6 +977,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             TranslationBlock *tb;
             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
+            __intercept_cpu_arch_state(cpu);
 
             /*
              * When requested, use an exact setting for cflags for the next
