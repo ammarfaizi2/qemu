@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "or/logger.h"
 #include "qemu/osdep.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
@@ -931,6 +932,27 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 }
 
 
+/*
+ * Watched guest RIP range.  Every guest instruction whose RIP falls in
+ * [OR_RIP_LO, OR_RIP_HI] gets its CPU registers dumped via or_log().
+ */
+#define OR_RIP_LO 0x401010ull
+#define OR_RIP_HI 0x401087ull
+
+/*
+ * True when @pc lies in any guest page that overlaps the watched range.
+ *
+ * We force single-instruction translation blocks across those whole pages
+ * (not just the exact range) so that a TB which starts before the range
+ * cannot span into it and execute several watched instructions in one go.
+ */
+static inline bool or_pc_in_watch_page(vaddr pc)
+{
+    vaddr page = pc & TARGET_PAGE_MASK;
+    return page >= (OR_RIP_LO & TARGET_PAGE_MASK) &&
+           page <= (OR_RIP_HI & TARGET_PAGE_MASK);
+}
+
 struct or_qemu_regs_x86_64 {
     uint64_t rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi;
     uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
@@ -943,6 +965,23 @@ struct or_qemu_regs_x86_64 {
     uint64_t rflags;
 };
 
+static void dump_regs(struct or_qemu_regs_x86_64 *regs)
+{
+    or_log(
+        "RIP = %#lx\n"
+        "RAX = %#lx, RCX = %#lx, RDX = %#lx, RBX = %#lx\n"
+        "RSP = %#lx, RBP = %#lx, RSI = %#lx, RDI = %#lx\n"
+        "R8  = %#lx, R9  = %#lx, R10 = %#lx, R11 = %#lx\n"
+        "R12 = %#lx, R13 = %#lx, R14 = %#lx, R15 = %#lx\n"
+        "----------\n",
+        regs->rip,
+        regs->rax, regs->rcx, regs->rdx, regs->rbx,
+        regs->rsp, regs->rbp, regs->rsi, regs->rdi,
+        regs->r8,  regs->r9,  regs->r10, regs->r11,
+        regs->r12, regs->r13, regs->r14, regs->r15
+    );
+}
+
 void or_intercept_cpu_arch_state(int cpu_index, struct or_qemu_regs_x86_64 *regs);
 
 void or_intercept_cpu_arch_state(int cpu_index, struct or_qemu_regs_x86_64 *regs)
@@ -952,6 +991,10 @@ void or_intercept_cpu_arch_state(int cpu_index, struct or_qemu_regs_x86_64 *regs
         :
         : "r"(regs), "r"(cpu_index)
         : "memory");
+
+    if (OR_RIP_LO <= regs->rip && regs->rip <= OR_RIP_HI) {
+        dump_regs(regs);
+    }
 }
 
 static void __intercept_cpu_arch_state(CPUState *cpu)
@@ -992,6 +1035,20 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 cpu->cflags_next_tb = -1;
             }
 
+            /*
+             * TB = Translation Block.  A TB is a chunk of code that we
+             * have translated from the guest architecture to the host
+             * architecture.
+             * 
+             * - Force single instruction per translation block.
+             * - Disable TB chaining (CF_NO_GOTO_TB / CF_NO_GOTO_PTR).
+             *
+             */
+            if (or_pc_in_watch_page(s.pc)) {
+                s.cflags = (s.cflags & ~CF_COUNT_MASK)
+                         | CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
+            }
+
             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
                 break;
             }
@@ -1026,8 +1083,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 last_tb = NULL;
             }
 #endif
-            /* See if we can patch the calling TB. */
-            if (last_tb) {
+            /*
+             * See if we can patch the calling TB.  Never create a direct
+             * jump into the watched range: a patched chain would bypass
+             * this loop and skip the per-instruction register dump on
+             * subsequent passes through the range.
+             */
+            if (last_tb && !or_pc_in_watch_page(s.pc)) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }
 

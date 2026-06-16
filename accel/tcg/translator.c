@@ -7,6 +7,7 @@
  * See the COPYING file in the top-level directory.
  */
 
+#include "or/logger.h"
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
