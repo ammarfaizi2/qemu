@@ -1,472 +1,419 @@
 # QEMU TCG Internals (x86-64 guest focus)
 
 This document explains how QEMU's **TCG** (Tiny Code Generator) — QEMU's portable
-dynamic binary translator — executes a guest, how it translates guest memory to
-host memory, and how many guest instructions the x86 target understands.
+dynamic binary translator — runs an x86-64 guest. TCG works by *translating* short
+runs of guest instructions into native host instructions, caching the result, and
+jumping into the cached host code. There is no per-instruction interpreter loop in
+the hot path: the guest effectively runs as host code that reads and writes a big
+in-memory `struct` representing the virtual CPU.
 
-The focus throughout is the **x86-64 guest** (`target/i386`). All file paths are
-relative to the repository root, and line numbers refer to the tree this document
-was written against (QEMU v11.0.0-rc2). Function names are stable across releases;
-exact line numbers may drift by a few lines over time.
+All file paths are relative to the repository root. Line numbers refer to the
+current tree and may drift slightly as the code evolves; function names are stable
+anchors.
 
-TCG runs in two modes:
+Throughout, keep three address spaces distinct:
 
-* **System emulation** (`CONFIG_USER_ONLY` *not* defined, a.k.a. "softmmu"):
-  emulates the full machine, including the guest MMU, page tables and devices.
-* **User-mode emulation** (`linux-user/`, `CONFIG_USER_ONLY` defined): runs a single
-  guest Linux process; guest virtual addresses map directly into the host process.
-
-Both modes share the same translation engine; they differ mainly in how memory is
-resolved (see §2).
+- **Guest virtual** — what the emulated x86-64 program sees (RIP, pointers, etc.).
+- **Guest physical** — what the emulated x86-64 MMU produces after a page-table walk.
+- **Host virtual** — a real pointer in the QEMU process where that guest byte lives.
 
 ---
 
-## Table of contents
+## 1. How are guest CPU instructions executed?
 
-1. [How guest CPU instructions are executed](#1-how-guest-cpu-instructions-are-executed)
-2. [How guest memory is translated to the host](#2-how-guest-memory-is-translated-to-the-host)
-3. [How many instructions are there](#3-how-many-instructions-are-there)
+The execution model is **translate once, execute many**. A chunk of guest code
+(a *Translation Block*, or **TB**) is decoded, lowered to TCG's intermediate
+representation (IR), compiled to host machine code, and cached. Subsequent
+executions jump straight into the cached host code.
 
----
+### 1.1 The main execution loop
 
-## 1. How guest CPU instructions are executed
+Entry point: [`cpu_exec()`](accel/tcg/cpu-exec.c#L1022) in
+[accel/tcg/cpu-exec.c](accel/tcg/cpu-exec.c#L1022). It sets up clocks and an
+RCU read-side critical section, then calls into
+[`cpu_exec_loop()`](accel/tcg/cpu-exec.c#L936) (via a `sigsetjmp` wrapper so that
+exceptions/interrupts can long-jump back to the top of the loop).
 
-QEMU does **not** interpret guest instructions one at a time. Instead it works like
-a JIT compiler: it translates a *basic block* of guest code (a **Translation Block**,
-or **TB**) into native host instructions once, caches the result, and re-executes
-the cached host code on every subsequent visit. Translation happens in two stages:
+[`cpu_exec_loop()`](accel/tcg/cpu-exec.c#L936) is the heart of the interpreter
+dispatch. Each iteration:
 
-```
-guest x86-64 bytes  --frontend-->  TCG IR ops  --backend-->  native host (x86-64) code
-   (target/i386)                  (architecture-neutral)         (tcg/<host-arch>)
-```
+1. Handles any pending exception or interrupt.
+2. Looks up the TB for the current guest PC with
+   [`tb_lookup()`](accel/tcg/cpu-exec.c#L230).
+3. Executes the TB's host code via `cpu_loop_exec_tb()` →
+   [`cpu_tb_exec()`](accel/tcg/cpu-exec.c#L431).
 
-### 1.1 The execution loop
+### 1.2 Finding or building a Translation Block
 
-Entry point: **`cpu_exec()`** — `accel/tcg/cpu-exec.c:1019`.
+[`tb_lookup()`](accel/tcg/cpu-exec.c#L230) first probes a fast per-CPU jump cache,
+then a global hash table (`qht_lookup_custom`, see
+[`tb_lookup_cmp()`](accel/tcg/cpu-exec.c#L161)). A TB is keyed on more than the PC:
+it also depends on `cs_base` and the CPU's `flags` (operand size, CPL, paging mode,
+etc.), because the same bytes can mean different things in 16/32/64-bit mode.
 
-It sets up clocks/RCU and calls into the inner loop via `cpu_exec_setjmp()`, which
-runs **`cpu_exec_loop()`** — `accel/tcg/cpu-exec.c:933`. The core of that loop is:
+On a miss, [`tb_gen_code()`](accel/tcg/translate-all.c#L261) in
+[accel/tcg/translate-all.c](accel/tcg/translate-all.c#L261) allocates a fresh
+[`TranslationBlock`](include/exec/translation-block.h#L46) and drives translation.
+The `TranslationBlock` struct records the guest `pc`, `cs_base`, `flags`, a pointer
+to the generated host code (`tc`), and the *block-chaining* pointers
+(`jmp_dest[]`, `jmp_list_*`) that let one TB jump directly to its successor without
+returning to the dispatch loop.
 
-```c
-while (!cpu_handle_exception(cpu, &ret)) {
-    TranslationBlock *last_tb = NULL;
-    int tb_exit = 0;
-    while (!cpu_handle_interrupt(cpu, &last_tb)) {
-        TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
-        s.cflags = cpu->cflags_next_tb;
+### 1.3 The target-independent translator loop
 
-        tb = tb_lookup(cpu, s);            /* find cached TB ...        */
-        if (tb == NULL) {
-            tb = tb_gen_code(cpu, s);      /* ... or translate one now  */
-        }
-        tb_add_jump(last_tb, tb_exit, tb); /* chain previous TB -> this */
-        cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit); /* run it  */
-    }
-}
-```
-
-Each iteration: **look up** the TB for the current guest PC, **translate** it if
-missing, **chain** it to the previously executed TB, then **execute** it.
-
-The "CPU state" key (`s`) bundles the guest PC, the segment base (`cs_base`), and
-the `flags` that capture the current execution mode (CPL, operand/address size,
-long-mode, etc.) — for x86 these are produced by the target's `get_tb_cpu_state`
-hook. A TB is only valid for one exact combination of these, which is why mode
-switches force fresh translations.
-
-### 1.2 Looking up a cached TB
-
-**`tb_lookup()`** — `accel/tcg/cpu-exec.c:227` — uses a two-level cache:
-
-* **L1: per-CPU jump cache** (`cpu->tb_jmp_cache`), a direct-mapped array of
-  `TB_JMP_CACHE_SIZE = 1 << 12` = 4096 entries indexed by a hash of the guest PC.
-  Defined in `accel/tcg/tb-jmp-cache.h` (`CPUJumpCache`, ~line 25). This is the
-  fast path — one hash, one comparison.
-* **L2: global hash table** `tb_ctx.htable`, a lock-free QHT keyed by the full
-  `(phys_pc, pc, flags, cs_base, cflags)` tuple. Looked up by
-  `tb_htable_lookup()` (`accel/tcg/cpu-exec.c:195`); the hash is computed by
-  `tb_hash_func()` in `accel/tcg/tb-hash.h` (xxhash over the key).
-
-On an L1 miss but L2 hit, the L1 entry is refilled. On a full miss, `tb_lookup`
-returns `NULL` and the loop translates a new block.
-
-### 1.3 Translating a block (frontend → IR → host code)
-
-**`tb_gen_code()`** — `accel/tcg/translate-all.c:261` — orchestrates translation:
-it allocates a TB and a slot in the host code buffer, runs the translation under a
-`sigsetjmp` guard, encodes unwind/search metadata, and links the finished TB into
-the hash table.
-
-The actual codegen happens in **`setjmp_gen_code()`** —
-`accel/tcg/translate-all.c:238`, called at `translate-all.c:325`:
-
-```c
-tcg_func_start(tcg_ctx);
-...
-cs->cc->tcg_ops->translate_code(cs, tb, max_insns, pc, host_pc); /* FRONTEND */
-...
-return tcg_gen_code(tcg_ctx, tb, pc);                            /* BACKEND  */
-```
-
-**Stage A — Frontend (guest → TCG IR).**
-For x86 the `translate_code` hook is **`x86_translate_code()`** —
-`target/i386/tcg/translate.c:3613`, which simply drives the generic
-**`translator_loop()`** — `accel/tcg/translator.c:122` — with the x86 operation
-table `i386_tr_ops` (`target/i386/tcg/translate.c:3605`):
-
-```c
-void x86_translate_code(CPUState *cpu, TranslationBlock *tb,
-                        int *max_insns, vaddr pc, void *host_pc)
-{
-    DisasContext dc;
-    translator_loop(cpu, tb, max_insns, pc, host_pc, &i386_tr_ops, &dc.base);
-}
-```
-
-`translator_loop()` is the architecture-neutral skeleton. It calls a small set of
-target callbacks (`TranslatorOps`, declared in `include/exec/translator.h`):
-
-| Callback | x86 implementation | Role |
-|----------|-------------------|------|
-| `init_disas_context` | `i386_tr_init_disas_context` | seed `DisasContext` from TB flags (CPL, sizes, mode) |
-| `insn_start` | `i386_tr_insn_start` | emit `insn_start` IR op, record guest PC for unwinding |
-| `translate_insn` | `i386_tr_translate_insn` (`translate.c:3507`) | **decode + emit IR for one guest instruction** |
-| `tb_stop` | `i386_tr_tb_stop` | emit the block-exit / branch code |
-
-The loop calls `translate_insn` repeatedly until the block ends (a branch, a mode
-change, the TCG op buffer filling up, or hitting `max_insns`). For x86,
-`i386_tr_translate_insn` (under a `sigsetjmp` so a faulting fetch can be turned into
-a guest exception) calls **`disas_insn()`** at `target/i386/tcg/translate.c:3527`.
-
-`disas_insn` (the table-driven decoder, **`decode-new.c.inc:2774`**) reads the
-opcode bytes (prefixes, REX/VEX, ModRM, SIB, immediates), decodes the instruction
-into an `X86DecodedInsn`, and calls the matching `gen_*` *emitter* (in
-`target/i386/tcg/emit.c.inc`) which appends TCG IR ops — not host instructions yet.
-See §3 for the decoder in detail.
-
-**Stage B — Backend (TCG IR → host code).**
-**`tcg_gen_code()`** — `tcg/tcg.c:6556` — turns the IR op stream into native host
-machine code. Its passes:
-
-1. `tcg_optimize()` — constant folding / strength reduction on the IR.
-2. Liveness analysis (`liveness_pass_1`, optionally `_2` for indirect temps).
-3. Register allocation + emission: it walks every `TCGOp`
-   (`QTAILQ_FOREACH(op, &s->ops, link)`), emitting host instructions via the
-   host backend in `tcg/<host-arch>/` (e.g. `tcg/i386/tcg-target.c.inc` for an
-   x86-64 host). Special ops (`insn_start`, `goto_tb`, `exit_tb`, `br`) are handled
-   directly; everything else goes through `tcg_reg_alloc_op()`.
-4. Relocation/constant-pool finalization and an instruction-cache flush
-   (`flush_idcache_range()`).
-
-The emitted host code is written into the TB's code buffer (`tb->tc.ptr`).
-
-### 1.4 Executing the host code
-
-**`cpu_tb_exec()`** — `accel/tcg/cpu-exec.c:428` — runs the translated block:
-
-```c
-ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);  /* jump into native code */
-last_tb = tcg_splitwx_to_rw((void *)(ret & ~TB_EXIT_MASK));
-*tb_exit = ret & TB_EXIT_MASK;
-```
-
-`tcg_qemu_tb_exec` is the TCG **prologue/epilogue** — a small piece of native code
-that loads guest CPU state into host registers, jumps to `tb_ptr`, and on return
-hands back the address of the last TB plus an exit code. The guest CPU register
-file lives in `CPUArchState` (for x86, `CPUX86State` — `env`), and the generated
-code reads/writes guest registers as offsets from the `env` pointer.
-
-### 1.5 Block chaining (why it's fast)
-
-Re-entering `cpu_exec_loop` for every block would be expensive. Instead, when one
-TB falls through or jumps to another, **`tb_add_jump()`**
-(`accel/tcg/cpu-exec.c:616`) *patches* the first TB's exit so the host code jumps
-**directly** into the next TB's host code, bypassing the dispatch loop entirely:
-
-```c
-tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc.ptr); /* overwrite the jump */
-```
-
-Chained TBs form a linked list (`jmp_list_head` / `jmp_list_next`) so the chain can
-be unpicked when a TB is invalidated. The result: hot loops execute almost entirely
-in cached, directly-chained native code, returning to `cpu_exec()` only for
-interrupts, exceptions, or invalidated blocks.
-
-TB invalidation (e.g. self-modifying code, or the guest unmapping a page) is handled
-in `accel/tcg/tb-maint.c` — `tb_link_page()` (`tb-maint.c:992`) inserts a TB and
-records which guest pages it covers; writes to those pages trigger invalidation.
-
-### 1.6 End-to-end flow
+Translation is split into a generic driver and target-specific callbacks. The
+driver is [`translator_loop()`](accel/tcg/translator.c#L122) in
+[accel/tcg/translator.c](accel/tcg/translator.c#L122). It walks instructions one at
+a time, calling a vtable of callbacks of type
+[`TranslatorOps`](include/exec/translator.h#L118):
 
 ```
-cpu_exec()                                  cpu-exec.c:1019
-└─ cpu_exec_loop()                          cpu-exec.c:933
-   ├─ tb_lookup()                           cpu-exec.c:227   (L1 jmp cache → L2 QHT)
-   │   └─ (miss) tb_gen_code()              translate-all.c:261
-   │       └─ setjmp_gen_code()             translate-all.c:238
-   │           ├─ x86_translate_code()      i386/tcg/translate.c:3613   [FRONTEND]
-   │           │   └─ translator_loop()     translator.c:122
-   │           │       └─ i386_tr_translate_insn() → disas_insn()  decode-new.c.inc:2774
-   │           │                              └─ gen_*() emitters    emit.c.inc
-   │           └─ tcg_gen_code()            tcg/tcg.c:6556              [BACKEND]
-   ├─ tb_add_jump()                         cpu-exec.c:616   (patch direct chain)
-   └─ cpu_loop_exec_tb() → cpu_tb_exec()    cpu-exec.c:428
-       └─ tcg_qemu_tb_exec()                run native host code
+ops->init_disas_context()   // set up per-block state
+ops->tb_start()
+loop:
+  ops->insn_start()
+  ops->translate_insn()     // decode ONE guest insn -> emit TCG IR
+  (until block-ending condition)
+ops->tb_stop()              // emit block exit / chaining
+```
+
+The loop stops at a branch, a page boundary, or after a cap on instructions, then
+emits the code that returns control to the dispatcher.
+
+### 1.4 x86-specific decoding
+
+The x86 implementation of those callbacks lives in
+[target/i386/tcg/translate.c](target/i386/tcg/translate.c). Key functions:
+
+- [`i386_tr_init_disas_context()`](target/i386/tcg/translate.c#L3438) — builds the
+  x86 [`DisasContext`](target/i386/tcg/translate.c#L85): operand/address size
+  (`dflag`/`aflag`), REX bits, CPL, MMU index, and a **cached copy of the guest's
+  CPUID feature words** (see §4).
+- [`i386_tr_translate_insn()`](target/i386/tcg/translate.c#L3507) — decodes a single
+  instruction, dispatching into
+  [`disas_insn()`](target/i386/tcg/decode-new.c.inc#L2763) in the table-driven
+  decoder [target/i386/tcg/decode-new.c.inc](target/i386/tcg/decode-new.c.inc).
+- The `TranslatorOps` vtable for i386 is wired up around
+  [translate.c:3606](target/i386/tcg/translate.c#L3606).
+
+`disas_insn()` recognizes the opcode (handling legacy, VEX, and EVEX prefixes) and
+emits **TCG IR ops** — a small, architecture-neutral RISC-like instruction set —
+that describe the instruction's effect on the guest CPU state.
+
+### 1.5 From TCG IR to host code, and running it
+
+After the whole block is expressed as TCG IR, the backend compiler
+[`tcg_gen_code()`](tcg/tcg.c#L6556) in [tcg/tcg.c](tcg/tcg.c) optimizes the IR, does
+register allocation and liveness analysis, and emits **native host instructions**
+through a per-host backend. For an x86-64 host that backend is
+[tcg/i386/tcg-target.c.inc](tcg/i386/tcg-target.c.inc).
+
+> Note the two independent x86 roles: the **guest** ISA decoder lives under
+> `target/i386/`, while the **host** code emitter lives under `tcg/i386/`. Running
+> an x86-64 guest on an x86-64 host uses both, but they are different subsystems.
+
+Finally, [`cpu_tb_exec()`](accel/tcg/cpu-exec.c#L431) actually runs the generated
+code by calling `tcg_qemu_tb_exec()` (declared in
+[include/tcg/tcg.h](include/tcg/tcg.h#L937)). This is just a call into the host
+code buffer with the guest-CPU pointer in a register. Its return value packs an
+exit reason in the low bits together with the next TB pointer, which the dispatch
+loop uses to decide what to do next.
+
+**End-to-end call chain:**
+
+```
+cpu_exec()                       accel/tcg/cpu-exec.c:1022
+ └ cpu_exec_loop()               accel/tcg/cpu-exec.c:936
+    ├ tb_lookup()                accel/tcg/cpu-exec.c:230   (cache hit?)
+    │  └ tb_gen_code()           accel/tcg/translate-all.c:261  (on miss)
+    │     └ translator_loop()    accel/tcg/translator.c:122
+    │        ├ i386_tr_translate_insn()  target/i386/tcg/translate.c:3507
+    │        │  └ disas_insn()           target/i386/tcg/decode-new.c.inc:2763  -> emit TCG IR
+    │        └ tcg_gen_code()    tcg/tcg.c:6556   -> emit host machine code
+    └ cpu_tb_exec()              accel/tcg/cpu-exec.c:431
+       └ tcg_qemu_tb_exec()      include/tcg/tcg.h:937   -> run native code
 ```
 
 ---
 
-## 2. How guest memory is translated to the host
+## 2. How are CPU registers stored in memory?
 
-There are **two** address translations to keep separate:
+The emulated CPU is a plain C `struct` on the host heap. Generated host code does
+not keep guest registers in host registers across instruction boundaries; instead
+it **loads from and stores to fields of this struct**. (TCG *does* temporarily hold
+values in host registers within a block, but the architectural state of record is
+always the struct.)
 
-* **Guest virtual → guest physical** — emulating the *guest* MMU (x86 page tables,
-  CR3, 4-/5-level paging). Only in system emulation.
-* **Guest physical → host virtual** — mapping the guest's RAM/devices onto memory
-  inside the QEMU host process (RAMBlocks, MemoryRegions).
+### 2.1 The `CPUX86State` struct
 
-TCG accelerates the common case with a **software TLB** ("softmmu") so that most
-guest loads/stores never walk page tables.
+Defined as `typedef struct CPUArchState { ... } CPUX86State;` at
+[target/i386/cpu.h:1986](target/i386/cpu.h#L1986) (closing at
+[cpu.h:2316](target/i386/cpu.h#L2316)). `CPUArchState` is the generic name; for the
+i386 target it *is* `CPUX86State`. Highlights:
 
-### 2.1 The software TLB (softmmu)
+| Guest state | Field | Location |
+|---|---|---|
+| GPRs (RAX..R15) | `target_ulong regs[CPU_NB_EREGS]` | [cpu.h:1988](target/i386/cpu.h#L1988) |
+| Instruction pointer | `target_ulong eip` | [cpu.h:1989](target/i386/cpu.h#L1989) |
+| Flags | `target_ulong eflags` (+ lazy `cc_*`) | [cpu.h:1990](target/i386/cpu.h#L1990) |
+| Lazy condition codes | `cc_dst`, `cc_src`, `cc_src2`, `cc_op` | [cpu.h:1995](target/i386/cpu.h#L1995) |
+| Segment registers | `SegmentCache segs[6]` (CS,DS,ES,FS,GS,SS) | [cpu.h:2005](target/i386/cpu.h#L2005) |
+| x87 stack | `FPReg fpregs[8]` | [cpu.h:2030](target/i386/cpu.h#L2030) |
+| SSE/AVX/AVX-512 vectors | `ZMMReg xmm_regs[CPU_NB_EREGS]` | [cpu.h:2045](target/i386/cpu.h#L2045) |
+| AVX-512 mask regs | `uint64_t opmask_regs[...]` | [cpu.h:2049](target/i386/cpu.h#L2049) |
+| CPUID feature words | `FeatureWordArray features` | [cpu.h:2233](target/i386/cpu.h#L2233) |
 
-Every guest memory access generated by TCG first consults a per-CPU software TLB.
-The TLB entry is **`CPUTLBEntry`** — `include/exec/tlb-common.h:25`:
+Two design points worth calling out:
 
-```c
-typedef union CPUTLBEntry {
-    struct {
-        uintptr_t addr_read;    /* comparator for loads          */
-        uintptr_t addr_write;   /* comparator for stores         */
-        uintptr_t addr_code;    /* comparator for code fetch     */
-        uintptr_t addend;       /* host_addr = guest_vaddr + addend */
-    };
-    ...
-} CPUTLBEntry;
-```
+- **Lazy flags.** Rather than recompute EFLAGS after every arithmetic op, x86 TCG
+  stores the *operands* (`cc_src`/`cc_dst`/`cc_src2`) and an opcode (`cc_op`)
+  describing how to derive the flags on demand. EFLAGS is materialized only when
+  actually read.
 
-The trick is `addend`: for a RAM page it is precomputed as
-`host_page_pointer - guest_virtual_page_address`, so once a virtual address passes
-the TLB tag check, the host address is a single add — `haddr = vaddr + addend`.
+- **Vector register aliasing.** XMM/YMM/ZMM are the same physical storage at
+  different widths. `ZMMReg` is a 512-bit union overlaying `XMMReg` (128-bit) and
+  `YMMReg` (256-bit); the union/typedef chain is defined around
+  [cpu.h:1647-1675](target/i386/cpu.h#L1647). So `xmm_regs[0]` is XMM0, YMM0, and
+  ZMM0 simultaneously.
 
-The TLB is indexed by a hash of the virtual page. **`tlb_index()`** —
-`accel/tcg/cputlb.c:127`:
+### 2.2 How the struct is reached at runtime
 
-```c
-return (addr >> TARGET_PAGE_BITS) & size_mask;   /* TARGET_PAGE_BITS = 12 (4 KiB) */
-```
+`CPUX86State` is embedded inside the per-CPU object `ArchCPU` (a.k.a. `X86CPU`),
+defined at [target/i386/cpu.h:2329](target/i386/cpu.h#L2329), which begins with the
+generic `CPUState parent_obj` followed by `CPUX86State env`. Helper accessors:
 
-There is one TLB per MMU mode (`CPUTLB.f[NB_MMU_MODES]`, see
-`include/hw/core/cpu.h`). Slow-path metadata that doesn't fit in the fast entry
-(physical address, `MemoryRegionSection`, attributes, permissions, page size) lives
-in the parallel **`CPUTLBEntryFull`** array (`include/hw/core/cpu.h:220`).
+- [`cpu_env(cpu)`](include/hw/core/cpu.h#L597) returns `(CPUArchState *)(cpu + 1)` —
+  i.e. `env` sits immediately after `CPUState`.
+- [`env_cpu(env)`](include/exec/cpu-common.h#L110) and
+  [`env_archcpu(env)`](include/exec/cpu-common.h#L88) go the other way.
 
-**Fast path.** The TCG backend *inlines* the TLB check directly into the generated
-host code (no function call): compute the index, load the comparator
-(`addr_read`/`addr_write`/`addr_code`), compare against the access address; on a
-match, add `addend` and do the load/store inline. The IR-level memory ops are
-`qemu_ld`/`qemu_st`, lowered per host in `tcg/<host>/tcg-target.c.inc`.
+Frequently-used, latency-sensitive state (notably the software TLB — see §3) is
+placed in a `CPUNegativeOffsetState` *before* `env` so it is reachable at small
+**negative** offsets from the `env` pointer, which keeps the generated code compact.
 
-**Slow path (TLB miss).** The inline check falls through to a helper
-(`helper_ldub_mmu`, `helper_stq_mmu`, … in `accel/tcg/ldst_common.c.inc`), which
-calls `do_ld*/do_st*_mmu` → `mmu_lookup()` in `accel/tcg/cputlb.c`. If the page is
-not resident, it calls **`tlb_fill_align()`** — `cputlb.c:1238` — which invokes the
-target's `tlb_fill` to populate the entry (§2.2), then installs it via
-**`tlb_set_page_full()`** — `cputlb.c:1024`.
+### 2.3 How generated code references registers
 
-### 2.2 Guest virtual → guest physical (x86 page-table walk)
-
-When the softmmu TLB misses, QEMU asks the x86 target to walk the *guest's* page
-tables. Entry point: **`x86_cpu_tlb_fill()`** —
-`target/i386/tcg/system/excp_helper.c:613`:
+At init time, [`tcg_x86_init()`](target/i386/tcg/translate.c#L3349) creates TCG
+"global" variables that are bound to fixed byte offsets inside `CPUX86State`:
 
 ```c
-if (get_physical_address(env, addr, access_type, mmu_idx, &out, &err, retaddr)) {
-    tlb_set_page_with_attrs(cs, addr & TARGET_PAGE_MASK,
-                            out.paddr & TARGET_PAGE_MASK,
-                            cpu_get_mem_attrs(env),
-                            out.prot, mmu_idx, out.page_size);
-    return true;             /* success: TLB entry installed */
-}
-/* else: raise #PF (page fault) into the guest */
+/* target/i386/tcg/translate.c  (excerpt) */
+cpu_regs[i] = tcg_global_mem_new(tcg_env,
+                                 offsetof(CPUX86State, regs[i]),
+                                 reg_names[i]);   /* "rax", "rbx", ... */
 ```
 
-* **`get_physical_address()`** — `excp_helper.c:546` — handles the mode dispatch:
-  paging disabled (identity map), real mode, and nested paging. For x86-64 with
-  paging on, it validates the address is **canonical** (correct sign-extension of
-  the unused high bits) and calls `mmu_translate`.
-* **`mmu_translate()`** — `excp_helper.c:142` — the actual page-table walker.
-  Starting from **CR3**, it reads each level of the hierarchy, checking
-  `PG_PRESENT_MASK`, permission bits (`PG_RW_MASK`, `PG_USER_MASK`, `PG_NX_MASK`),
-  reserved bits, and large-page (`PG_PSE_MASK`) flags, and sets the
-  accessed/dirty bits.
+`tcg_env` (declared `extern TCGv_env tcg_env;` in
+[include/tcg/tcg.h:451](include/tcg/tcg.h#L451)) is the IR value that, at runtime,
+holds the pointer to `CPUX86State` — it is effectively the first argument to every
+generated block. The `cpu_regs[]` / `cpu_seg_base[]` / `cpu_eip` TCGv globals are
+declared near [translate.c:77](target/i386/tcg/translate.c#L77).
 
-For 64-bit long mode the walk uses 9 bits of the virtual address per level:
-
-```
-4-level paging (48-bit VA):  CR3 → PML4[47:39] → PDPT[38:30] → PD[29:21] → PT[20:12] → page[11:0]
-5-level paging (LA57, 57-bit VA) adds: PML5[56:48] on top
-```
-
-Large pages short-circuit the walk: a 1 GiB page stops at the PDPT level, a 2 MiB
-page at the PD level, otherwise a 4 KiB page resolves at the PT level. The chosen
-size is returned as `out.page_size` and recorded in the TLB so one entry can cover
-a large page. `TARGET_VIRT_ADDR_SPACE_BITS` is 47 and `TARGET_PAGE_BITS` is 12 for
-x86-64 (`target/i386/cpu-param.h`).
-
-### 2.3 Guest physical → host virtual
-
-`tlb_set_page_full()` must convert the guest *physical* address into a real host
-pointer to compute `addend`. It calls **`address_space_translate_for_iotlb()`** —
-`system/physmem.c:686` — which walks QEMU's memory map (`MemoryRegion` /
-`MemoryRegionSection`, traversing any IOMMU layers) to find the region backing that
-physical address. Then in `cputlb.c` (~line 1068):
-
-```c
-if (is_ram || is_romd) {
-    /* RAM: addend points addend = host_base + (guest_paddr - region_offset) */
-    addend = (uintptr_t)memory_region_get_ram_ptr(section->mr) + xlat;
-} else {
-    /* MMIO/device: no host RAM — force slow path on every access */
-    addend = 0;
-}
-```
-
-For RAM, the host pointer ultimately comes from a **`RAMBlock`** (host mmap'd
-memory). `qemu_ram_ptr_length()` — `system/physmem.c:2720` — resolves
-`(RAMBlock, offset)` to `block->host + offset`. For MMIO, `addend == 0` and the
-matching TLB comparator carries `TLB_MMIO`, so accesses always trap to the slow
-path and are dispatched to the device model instead of touching host RAM.
-
-So the full chain for one guest load, on a cold TLB, is:
-
-```
-guest virtual addr
-   │  x86 page-table walk (mmu_translate, CR3 → PML4/…/PT)   excp_helper.c:142
-   ▼
-guest physical addr
-   │  memory-map / IOMMU lookup (address_space_translate_for_iotlb) physmem.c:686
-   ▼
-MemoryRegion + offset  →  RAMBlock host pointer (qemu_ram_ptr_length)  physmem.c:2720
-   │  addend = host_ptr - guest_vaddr   (cached in CPUTLBEntry)        cputlb.c:1024
-   ▼
-host virtual addr      →  subsequent hits: haddr = vaddr + addend (inline, no walk)
-```
-
-### 2.4 User-mode emulation: no software TLB
-
-In `linux-user` mode there is **no guest MMU** and no software TLB. The guest
-address space is a single contiguous mapping inside the host process at a fixed
-offset, `guest_base`. Translation is a plain add — **`g2h_untagged_vaddr()`** —
-`include/user/guest-host.h:47`:
-
-```c
-static inline void *g2h_untagged_vaddr(vaddr x)
-{
-    return (void *)((uintptr_t)(x) + guest_base);  /* host = guest + guest_base */
-}
-```
-
-with the inverse `h2g()` subtracting `guest_base` (`guest-host.h:71`). Guest page
-permissions are tracked in a software page table (`page_get_flags`) and access
-violations are delivered as guest signals. The split is selected at compile time in
-`include/accel/tcg/cpu-ldst.h` via `CONFIG_USER_ONLY`.
+So a guest `mov %rbx, %rax` becomes IR roughly equivalent to
+`st_tl(cpu_regs[RBX], tcg_env, offsetof(CPUX86State, regs[RAX]))`, which the host
+backend turns into a single host load/store relative to the `env` register. Helpers
+[`gen_op_mov_v_reg()`](target/i386/tcg/translate.c#L454) and
+[`gen_op_mov_reg_v()`](target/i386/tcg/translate.c#L448) wrap this pattern. Fields
+without a dedicated global (e.g. `hflags`, `eflags`) are accessed by explicit
+`tcg_gen_ld_tl/st_tl(..., offsetof(CPUX86State, field))`.
 
 ---
 
-## 3. How many instructions are there
+## 3. How is guest memory translated to host memory?
 
-"How many x86 instructions does QEMU's TCG frontend support?" has a few defensible
-answers depending on what you count. The decoder lives in `target/i386/tcg/` and is
-split into a modern table-driven decoder plus a legacy switch-based path.
+A guest memory access must traverse **guest-virtual → guest-physical → host-virtual**.
+TCG splits this into a fast inline path (a software TLB lookup emitted directly into
+the generated code) and a slow path (an x86 page-table walk plus a physical→host
+resolution) that runs only on a TLB miss.
 
-### 3.1 The decoder structure
+### 3.1 The software TLB (fast path)
 
-The current decoder is **table-driven**, in
-`target/i386/tcg/decode-new.c.inc` (entry: `disas_insn()` at line 2774). Decoding
-proceeds through opcode tables, one per opcode "map":
+Each CPU carries a [`CPUTLB`](include/hw/core/cpu.h#L327), reachable at a negative
+offset from `env` (see §2.2). Its per-entry payload,
+[`CPUTLBEntry`](include/exec/tlb-common.h#L25), holds:
 
-| Table | Location | Slots | Covers |
-|-------|----------|-------|--------|
-| `opcodes_root[256]` | `decode-new.c.inc:1698` | 256 | one-byte opcodes `00–FF` |
-| `opcodes_0F[256]` | `decode-new.c.inc:1270` | 256 | two-byte `0F xx` (most SSE/MMX) |
-| `opcodes_0F38_00toEF[240]` | `decode-new.c.inc:704` | 240 | three-byte `0F 38 xx` (SSSE3/SSE4/AVX/FMA/AES/SHA) |
-| `opcodes_0F3A[256]` | `decode-new.c.inc:957` | 256 | three-byte `0F 3A xx` (immediate-form AVX etc.) |
+- comparator words `addr_read` / `addr_write` / `addr_code` — the guest virtual page
+  tag for each access type, and
+- `addend` ([tlb-common.h:34](include/exec/tlb-common.h#L34)) — the value to *add* to
+  a guest virtual address to obtain the **host** address, valid only for directly
+  accessible RAM.
 
-Each populated slot is an `X86OpEntry` produced by `X86_OP_ENTRY*` macros, naming
-the operation, its operand specifiers, and a CPUID feature gate. Sub-byte "groups"
-(opcodes that select an operation via the ModRM `reg` field) are expanded by
-dedicated decoders, e.g. `decode_group1` (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP),
-`decode_group2` (the rotates/shifts ROL/ROR/RCL/RCR/SHL/SHR/SAR), `decode_group3`
-(TEST/NOT/NEG/MUL/IMUL/DIV/IDIV), etc.
+The TCG memory-access op generators in
+[tcg/tcg-op-ldst.c](tcg/tcg-op-ldst.c) emit, for every guest load/store, inline host
+code that: indexes the TLB by virtual page, compares against the entry's comparator,
+and on a hit computes `host_ptr = guest_vaddr + addend` and performs the access — no
+function call. This is why steady-state emulated memory access is cheap.
 
-A **legacy decoder** still lives in `target/i386/tcg/translate.c`. It handles
-opcodes not yet migrated to the new tables — primarily the **x87 FPU** opcodes
-`D8–DF` and various **system/privileged** instructions (`0F 00`/`0F 01`/`0F C7`
-groups: LGDT/LIDT/SGDT/SIDT/LMSW/INVLPG/SWAPGS/RDTSCP/XGETBV/MONITOR/MWAIT/…) and
-MPX. Both decoders coexist in one build: `translate.c` `#include`s both
-`emit.c.inc` (line 2151) and `decode-new.c.inc` (line 3347).
+### 3.2 TLB miss → x86 page-table walk (slow path)
 
-### 3.2 Counting by emitter functions
+On a comparator mismatch, the generated code calls into
+[accel/tcg/cputlb.c](accel/tcg/cputlb.c). The refill machinery
+[`tlb_fill_align()`](accel/tcg/cputlb.c#L1238) invokes the target's
+`tlb_fill` callback. For i386 that callback is registered in the
+[`x86_tcg_ops`](target/i386/tcg/tcg-cpu.c#L160) table as
+`.tlb_fill = x86_cpu_tlb_fill` ([tcg-cpu.c:180](target/i386/tcg/tcg-cpu.c#L180)).
 
-After decoding, each instruction is realized by a `gen_*` *emitter* in
-`target/i386/tcg/emit.c.inc`. Counting these gives a concrete lower bound on
-distinct operations handled by the new decoder:
+[`x86_cpu_tlb_fill()`](target/i386/tcg/system/excp_helper.c#L613) (in
+[target/i386/tcg/system/excp_helper.c](target/i386/tcg/system/excp_helper.c)) calls
+[`get_physical_address()`](target/i386/tcg/system/excp_helper.c#L546), which selects
+the paging mode from CR0/CR4/EFER and calls
+[`mmu_translate()`](target/i386/tcg/system/excp_helper.c#L142). `mmu_translate()` is
+the actual x86 page walker: starting from CR3 it descends the paging structures
+(PML5E → PML4E → PDPTE → PDE → PTE for 5-level paging, with shortcuts for 1 GiB and
+2 MiB large pages), checks Present/Writable/User/NX permissions, and produces the
+guest **physical** address plus a protection mask. On a fault it raises #PF with the
+faulting address in CR2.
+
+### 3.3 Guest-physical → host-virtual, and TLB population
+
+A successful walk yields a guest physical address, which must be resolved to a real
+host pointer. That mapping is owned by the memory subsystem in
+[system/physmem.c](system/physmem.c): `address_space_translate_*` walks the
+`FlatView` of mapped regions to find the `MemoryRegionSection`, and
+`qemu_ram_ptr_length()` / `qemu_map_ram_ptr()` convert a `RAMBlock` + offset into a
+host pointer (`RAMBlock.host + offset`).
+
+The result is written back into the TLB by
+[`tlb_set_page_full()`](accel/tcg/cputlb.c#L1024). For ordinary RAM it computes
+`addend = host_ram_pointer + xlat - guest_vaddr_page` so that the fast-path formula
+`guest_vaddr + addend` lands on the correct host byte; for MMIO it sets `addend = 0`
+and flags the entry so accesses are routed through the device-emulation
+(`MemoryRegion` read/write) path instead of a raw pointer dereference. Slow-path
+metadata (physical address, attributes, page size, protections) lives in
+[`CPUTLBEntryFull`](include/hw/core/cpu.h#L214).
+
+Once the entry is installed, control returns to the faulting instruction, which
+re-runs the inline lookup — now a hit — and completes. Subsequent accesses to the
+same page stay entirely on the fast path.
+
+**Slow-path chain:**
 
 ```
-$ grep -c '^static void gen_'                 target/i386/tcg/emit.c.inc   →  284
-$ grep -oE '^static void gen_[A-Za-z0-9_]+' …  | sort -u | wc -l           →  260
+(inline TLB miss in generated code)
+ └ tlb_fill_align()              accel/tcg/cputlb.c:1238
+    └ x86_cpu_tlb_fill()         target/i386/tcg/system/excp_helper.c:613
+       └ get_physical_address()  target/i386/tcg/system/excp_helper.c:546
+          └ mmu_translate()      target/i386/tcg/system/excp_helper.c:142   (walk page tables)
+    └ tlb_set_page_full()        accel/tcg/cputlb.c:1024
+       └ address_space_translate_* / qemu_ram_ptr_length()   system/physmem.c   (phys -> host)
 ```
 
-So roughly **~260 distinct instruction emitters** in the table-driven path. Some
-emitters are shared across many encodings (one `gen_*` serves several opcode-table
-slots — e.g. the ALU and shift groups), so the number of *encodings* is larger than
-the number of emitters.
-
-### 3.3 Counting by mnemonics
-
-Counting distinct instruction **mnemonics** referenced across the opcode tables
-(via `X86_OP_ENTRY*`) plus the legacy x87/system instructions in `translate.c`
-lands in the **~370–400** range. The exact figure depends on how you count
-families: each of `Jcc`, `SETcc`, and `CMOVcc` is one emitter but 16 condition
-encodings; SSE/AVX often pair a legacy form and a VEX form of "the same"
-instruction.
-
-### 3.4 Why there's no single number
-
-The honest answer is a **range with a definition attached**:
-
-| What you count | Approximate number | Where |
-|----------------|--------------------|-------|
-| Distinct `gen_*` emitters (new decoder) | **~260** | `emit.c.inc` |
-| `static void gen_*` definitions incl. helpers | **284** | `emit.c.inc` |
-| Distinct instruction mnemonics (new + legacy) | **~370–400** | opcode tables + `translate.c` |
-| Opcode-table slots (encodings, incl. prefix variants) | **>700** | the four `opcodes_*` tables |
-
-QEMU's x86 frontend targets essentially the full modern instruction set: the base
-integer ISA, x87, MMX, the SSE family (SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/SSE4A),
-AVX/AVX2, FMA, BMI1/BMI2, ADX, AES-NI, PCLMULQDQ, SHA-NI, F16C, and the common
-system instructions — gated at decode time by per-instruction **CPUID feature
-flags** (`X86CPUIDFeature`, `decode-new.h:103`) so that a guest only sees the
-instructions its configured CPU model advertises.
+> User-mode emulation (`qemu-x86_64` running a Linux binary) skips the page-table
+> walk: there is no guest MMU, so guest-virtual maps to host-virtual through a fixed
+> offset and the `tlb_fill` path resolves directly against the process address space.
 
 ---
 
-## Quick reference — key files
+## 4. How are CPU features handled (SSE, AVX, AVX2, AVX-512, APX, …)?
 
-| Concern | File | Key symbols |
-|---------|------|-------------|
-| CPU dispatch loop | `accel/tcg/cpu-exec.c` | `cpu_exec` (1019), `cpu_exec_loop` (933), `tb_lookup` (227), `cpu_tb_exec` (428), `tb_add_jump` (616) |
-| TB generation | `accel/tcg/translate-all.c` | `tb_gen_code` (261), `setjmp_gen_code` (238) |
-| Translation skeleton | `accel/tcg/translator.c` | `translator_loop` (122) |
-| TB cache/invalidation | `accel/tcg/tb-maint.c`, `tb-jmp-cache.h`, `tb-hash.h` | `tb_link_page` (992), `CPUJumpCache`, `tb_hash_func` |
-| TCG backend (IR→host) | `tcg/tcg.c`, `tcg/<host>/tcg-target.c.inc` | `tcg_gen_code` (6556) |
-| x86 frontend | `target/i386/tcg/translate.c` | `x86_translate_code` (3613), `i386_tr_ops` (3605), `disas_insn` call (3527) |
-| x86 decoder | `target/i386/tcg/decode-new.c.inc`, `decode-new.h` | `disas_insn` (2774), `opcodes_root` (1698) |
-| x86 emitters | `target/i386/tcg/emit.c.inc` | `gen_*` functions |
-| Software TLB | `accel/tcg/cputlb.c`, `include/exec/tlb-common.h` | `CPUTLBEntry` (25), `tlb_index` (127), `tlb_set_page_full` (1024), `tlb_fill_align` (1238) |
-| x86 page-table walk | `target/i386/tcg/system/excp_helper.c` | `x86_cpu_tlb_fill` (613), `get_physical_address` (546), `mmu_translate` (142) |
-| Guest-phys → host | `system/physmem.c` | `address_space_translate_for_iotlb` (686), `qemu_ram_ptr_length` (2720) |
-| User-mode mapping | `include/user/guest-host.h` | `g2h_untagged_vaddr` (47), `h2g` (71) |
-| x86 address params | `target/i386/cpu-param.h` | `TARGET_PAGE_BITS` 12, `TARGET_VIRT_ADDR_SPACE_BITS` 47 |
+CPU features have two jobs in QEMU: (a) tell the guest what exists, via CPUID, and
+(b) gate the decoder so that an instruction the configured CPU doesn't support
+raises #UD instead of executing.
+
+### 4.1 Feature words and bit definitions
+
+Features are grouped into **feature words**, each corresponding to one CPUID
+leaf/register. The [`enum FeatureWord`](target/i386/cpu.h#L681) lists them
+(`FEAT_1_EDX`, `FEAT_1_ECX`, `FEAT_7_0_EBX`, `FEAT_7_1_EDX`, …), and the
+[`feature_word_info[]`](target/i386/cpu.c#L1046) table in
+[target/i386/cpu.c](target/i386/cpu.c) ties each word to its CPUID leaf, register,
+and the human-readable name of every bit.
+
+The individual bit macros are in [target/i386/cpu.h](target/i386/cpu.h):
+
+| Feature | Macro | Word | Line |
+|---|---|---|---|
+| SSE / SSE2 | `CPUID_SSE`, `CPUID_SSE2` | FEAT_1_EDX | [762](target/i386/cpu.h#L762) |
+| SSE3/SSSE3/SSE4.1/SSE4.2 | `CPUID_EXT_SSE3` … `CPUID_EXT_SSE42` | FEAT_1_ECX | [773](target/i386/cpu.h#L773) |
+| AVX | `CPUID_EXT_AVX` | FEAT_1_ECX | [803](target/i386/cpu.h#L803) |
+| AVX2 | `CPUID_7_0_EBX_AVX2` | FEAT_7_0_EBX | [899](target/i386/cpu.h#L899) |
+| AVX-512F | `CPUID_7_0_EBX_AVX512F` | FEAT_7_0_EBX | [917](target/i386/cpu.h#L917) |
+| AVX-512 DQ/BW/VL | `CPUID_7_0_EBX_AVX512{DQ,BW,VL}` | FEAT_7_0_EBX | [919](target/i386/cpu.h#L919) |
+| AVX-512 FP16 | `CPUID_7_0_EDX_AVX512_FP16` | FEAT_7_0_EDX | [1013](target/i386/cpu.h#L1013) |
+| APX Foundation | `CPUID_7_1_EDX_APXF` | FEAT_7_1_EDX | [1082](target/i386/cpu.h#L1082) |
+
+### 4.2 Per-CPU feature storage
+
+Each CPU's enabled feature set lives in the `features` array inside `CPUX86State`
+([cpu.h:2233](target/i386/cpu.h#L2233)), typed
+`FeatureWordArray` (`uint64_t[FEATURE_WORDS]`). A check is simply
+`env->features[FEAT_7_0_EBX] & CPUID_7_0_EBX_AVX2`. Companion arrays track
+`user_features` (explicit `+feat`/`-feat` requests) and `filtered_features`
+(requested but unavailable on this host/accelerator).
+
+### 4.3 Reporting features to the guest (CPUID)
+
+When the guest executes `CPUID`, the decoder calls a helper that lands in
+[`cpu_x86_cpuid()`](target/i386/cpu.c#L8603). It composes each leaf from
+`env->features[]`: leaf 1 returns `FEAT_1_ECX`/`FEAT_1_EDX` (SSE/AVX), leaf 7
+subleaf 0 returns `FEAT_7_0_EBX/ECX/EDX` (AVX2, AVX-512), leaf 7 subleaf 1 returns
+`FEAT_7_1_EAX/EDX` (AVX-VNNI, APX), and so on. Dependent leaves are gated — e.g. the
+APX leaf `0x29` is only populated when `CPUID_7_1_EDX_APXF` is set.
+
+### 4.4 Gating the decoder
+
+At the start of each block, [`i386_tr_init_disas_context()`](target/i386/tcg/translate.c#L3438)
+caches the relevant feature words into the `DisasContext` (fields
+`cpuid_features`, `cpuid_ext_features`, `cpuid_7_0_ebx_features`, …, populated around
+[translate.c:3472](target/i386/tcg/translate.c#L3472)). Caching avoids chasing the
+`env` pointer for every instruction.
+
+The table-driven decoder then checks these bits before emitting code. The central
+predicate is [`has_cpuid_feature()`](target/i386/tcg/decode-new.c.inc#L2510) in
+[target/i386/tcg/decode-new.c.inc](target/i386/tcg/decode-new.c.inc), e.g.:
+
+```c
+case X86_FEAT_AVX:    return s->cpuid_ext_features    & CPUID_EXT_AVX;
+case X86_FEAT_AVX2:   return s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_AVX2;  /* :2574 */
+```
+
+Each decoded entry names the feature it requires; the common dispatch path checks it
+at [decode-new.c.inc:2952](target/i386/tcg/decode-new.c.inc#L2952)
+(`if (!has_cpuid_feature(s, decode.e.cpuid)) goto illegal;`), and specific cases add
+extra constraints — for instance a 256-bit VEX form requires AVX2
+([decode-new.c.inc:2625](target/i386/tcg/decode-new.c.inc#L2625)). A failed check
+emits a #UD (illegal-opcode) exception into the guest rather than the instruction's
+semantics. Thus the *same* host build of QEMU will run or refuse AVX-512 purely based
+on the configured guest CPU model.
+
+### 4.5 Where feature sets come from: CPU models and filtering
+
+Named guest CPUs (`-cpu Skylake-Server`, `Granite-Rapids`, etc.) are defined in the
+[`builtin_x86_defs[]`](target/i386/cpu.c#L3542) table, each enumerating its
+`.features[FEAT_*]` bits. `-cpu max` (and KVM's `-cpu host`) instead turns on
+everything the accelerator can support, handled by the `max` CPU class around
+[cpu.c:7355](target/i386/cpu.c#L7355).
+
+During realize, [`x86_cpu_expand_features()`](target/i386/cpu.c#L9689) applies the
+`feature_dependencies[]` graph (auto-enabling implied features — e.g. enabling APXF
+pulls in the `FEAT_29_0_EBX` APX sub-features), and
+[`x86_cpu_filter_features()`](target/i386/cpu.c#L9888) removes any bit the current
+accelerator can't actually emulate, recording it in `filtered_features` so the user
+gets a warning. The net result is the `env->features[]` array that both CPUID
+reporting (§4.3) and decoder gating (§4.4) read.
+
+### 4.6 A note on APX
+
+As of this tree, **APX** (Advanced Performance Extensions: the REX2 prefix, EVEX-promoted
+GPR forms, R16–R31) is **defined and plumbed but not yet executed under TCG**. The
+`CPUID_7_1_EDX_APXF` bit, the `0x29` CPUID leaf, XSAVE/migration state, and GDB stub
+register exposure all exist, but `decode-new.c.inc` does not yet decode the APX
+instruction forms — a guest issuing them under TCG will take #UD. Contrast this with
+SSE/AVX/AVX2/AVX-512, which are fully decoded and emulated. (Support is evolving;
+re-check `decode-new.c.inc` for REX2/EVEX-APX handling against the current tree.)
+
+---
+
+## Quick file map
+
+| Concern | Primary files |
+|---|---|
+| Execution loop & TB cache | [accel/tcg/cpu-exec.c](accel/tcg/cpu-exec.c), [accel/tcg/translate-all.c](accel/tcg/translate-all.c) |
+| Generic translator driver | [accel/tcg/translator.c](accel/tcg/translator.c), [include/exec/translator.h](include/exec/translator.h) |
+| x86 guest decoder | [target/i386/tcg/translate.c](target/i386/tcg/translate.c), [target/i386/tcg/decode-new.c.inc](target/i386/tcg/decode-new.c.inc) |
+| TCG IR → host code | [tcg/tcg.c](tcg/tcg.c), [tcg/tcg-op.c](tcg/tcg-op.c), host backend [tcg/i386/tcg-target.c.inc](tcg/i386/tcg-target.c.inc) |
+| Guest CPU state | [target/i386/cpu.h](target/i386/cpu.h) (`CPUX86State`) |
+| Software TLB / mem access | [accel/tcg/cputlb.c](accel/tcg/cputlb.c), [tcg/tcg-op-ldst.c](tcg/tcg-op-ldst.c), [include/exec/tlb-common.h](include/exec/tlb-common.h) |
+| x86 page-table walk | [target/i386/tcg/system/excp_helper.c](target/i386/tcg/system/excp_helper.c) |
+| Guest-phys → host | [system/physmem.c](system/physmem.c) |
+| CPU features / CPUID | [target/i386/cpu.c](target/i386/cpu.c), [target/i386/cpu.h](target/i386/cpu.h) |
