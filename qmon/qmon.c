@@ -1,0 +1,913 @@
+/*
+ * qmon.so - a QEMU TCG introspection plugin.
+ *
+ * Exposes a tiny framed protocol over a unix socket so that an *external*
+ * program can, against a running TCG guest, and without ptrace:
+ *
+ *   1. dump guest CPU registers              (READ_REGS)
+ *   2. dump guest virtual / physical memory  (READ_VMEM / READ_PMEM)
+ *   3. translate gva->gpa and list mappings  (XLATE / LIST_MAP)
+ *   4. set a memory watchpoint + get events  (SET_WATCH -> EV_WATCH)
+ *   5. set a %rip breakpoint + freeze/inspect (SET_BREAK -> EV_BREAK)
+ *
+ * Build out-of-tree: depends only on <qemu-plugin.h> and glib. See Makefile.
+ *
+ * Design note (important): qemu_plugin_read_register(),
+ * qemu_plugin_read_memory_vaddr()/hwaddr() and qemu_plugin_translate_vaddr()
+ * are only valid on the *vCPU thread, inside a callback*. The socket I/O runs
+ * on its own pthread, so it cannot touch guest state directly. Instead it
+ * enqueues a command that a vCPU-thread callback (the per-TB "pump", or the
+ * stop-loop of a vCPU frozen at a breakpoint) executes and completes. Because
+ * those reads happen at a TB-boundary safe point, the snapshots are consistent
+ * (no torn reads, env fully synced).
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+#include <glib.h>
+#include <qemu-plugin.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+/* ------------------------------------------------------------------ */
+/* Wire protocol                                                       */
+/* ------------------------------------------------------------------ */
+/* Every message is: u32 len (LE) followed by len payload bytes.       */
+/* payload[0] is the message type, the rest is type specific.          */
+
+enum {
+    /* requests (client -> plugin) */
+    REQ_PING       = 0x01,
+    REQ_READ_REGS  = 0x10, /* u32 vcpu */
+    REQ_READ_VMEM  = 0x11, /* u32 vcpu, u64 addr, u32 len */
+    REQ_READ_PMEM  = 0x12, /* u32 vcpu, u64 addr, u32 len */
+    REQ_XLATE      = 0x13, /* u32 vcpu, u64 addr */
+    REQ_LIST_MAP   = 0x14, /* u32 vcpu */
+    REQ_SET_BREAK  = 0x20, /* u64 addr */
+    REQ_CLR_BREAK  = 0x21, /* u64 addr */
+    REQ_SET_WATCH  = 0x22, /* u64 addr, u64 len, u8 rw (1=R,2=W,3=RW) */
+    REQ_CLR_WATCH  = 0x23, /* u64 addr */
+    REQ_CONTINUE   = 0x30, /* u32 vcpu (0xffffffff = all) */
+
+    /* responses / events (plugin -> client) */
+    RSP_OK         = 0x80, /* type-specific payload */
+    RSP_ERR        = 0x81, /* u32 code, cstring msg */
+    EV_BREAK       = 0xA0, /* u32 vcpu, u64 rip, u64 bp_addr */
+    EV_WATCH       = 0xA1, /* u32 vcpu, u64 rip, u64 addr, u8 store, u8 size, u64 val */
+};
+
+#define QMON_MAX_FRAME (1u << 20)
+#define QMON_REQ_TIMEOUT_US (2 * 1000 * 1000)   /* abandon if no vCPU services */
+#define QMON_MAX_MAPS  8192
+#define QMON_MAX_WALK  (1u << 22)               /* PTE-read budget for LIST_MAP */
+
+/* ------------------------------------------------------------------ */
+/* little-endian encode/decode helpers                                 */
+/* ------------------------------------------------------------------ */
+
+static void le32enc(uint8_t *p, uint32_t v)
+{
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+static void le64enc(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)(v >> (8 * i));
+    }
+}
+static uint32_t le32dec(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+static uint64_t le64dec(const uint8_t *p)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= (uint64_t)p[i] << (8 * i);
+    }
+    return v;
+}
+
+/* GByteArray builders */
+static void p8(GByteArray *b, uint8_t v) { g_byte_array_append(b, &v, 1); }
+static void p32(GByteArray *b, uint32_t v) { uint8_t t[4]; le32enc(t, v); g_byte_array_append(b, t, 4); }
+static void p64(GByteArray *b, uint64_t v) { uint8_t t[8]; le64enc(t, v); g_byte_array_append(b, t, 8); }
+
+/* request reader with bounds checking */
+typedef struct {
+    const uint8_t *p;
+    size_t n, off;
+    bool err;
+} Rd;
+
+static uint8_t g8(Rd *r)
+{
+    if (r->off + 1 > r->n) { r->err = true; return 0; }
+    return r->p[r->off++];
+}
+static uint32_t g32(Rd *r)
+{
+    if (r->off + 4 > r->n) { r->err = true; return 0; }
+    uint32_t v = le32dec(r->p + r->off); r->off += 4; return v;
+}
+static uint64_t g64(Rd *r)
+{
+    if (r->off + 8 > r->n) { r->err = true; return 0; }
+    uint64_t v = le64dec(r->p + r->off); r->off += 8; return v;
+}
+
+/* ------------------------------------------------------------------ */
+/* global state                                                        */
+/* ------------------------------------------------------------------ */
+
+/* command serviced on a vCPU thread (one in flight at a time) */
+typedef struct {
+    int type;
+    uint32_t vcpu;
+    uint64_t addr;
+    uint32_t len;
+    bool any_vcpu;          /* may be serviced by any vCPU */
+    GByteArray *out;        /* RSP_OK payload built here */
+    int status;             /* 0 = ok, !=0 = error */
+    char err[96];
+    bool claimed;
+    bool done;
+} Cmd;
+
+static GMutex lock;             /* protects everything below */
+static GCond done_cond;         /* signalled when an in-flight Cmd completes */
+static GCond work_cond;         /* wakes a frozen vCPU's stop-loop */
+static Cmd *g_inflight;
+
+static GHashTable *bp_set;      /* key: gint64* gva -> membership */
+static GArray *wp_list;         /* Watch[] */
+static _Atomic int n_bp;        /* fast-path gate for bp_cb */
+static _Atomic int n_wp;        /* fast-path gate for wp_cb */
+static _Atomic int pending;     /* fast-path gate for the pump */
+
+static bool *stopped;           /* per-vcpu: frozen in a breakpoint stop-loop */
+static bool *continue_req;      /* per-vcpu: client asked to resume */
+static int g_max_vcpus = 1;
+
+static GArray *g_regs;          /* qemu_plugin_reg_descriptor[] (captured once) */
+static bool g_regs_done;
+
+static GMutex wlock;            /* serialises socket writes (RSP + events) */
+static _Atomic int conn_fd = -1;
+static char *g_sock_path;
+static qemu_plugin_id_t g_id;
+static bool feat_bp = true;     /* instrument insns for breakpoints */
+static bool feat_wp = true;     /* instrument mem ops for watchpoints */
+
+typedef struct {
+    uint64_t addr;
+    uint64_t len;
+    uint8_t rw;                 /* 1=R, 2=W, 3=RW */
+} Watch;
+
+/* ------------------------------------------------------------------ */
+/* socket I/O                                                          */
+/* ------------------------------------------------------------------ */
+
+static int read_n(int fd, void *buf, size_t n)
+{
+    uint8_t *p = buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r == 0) { return 0; }
+        if (r < 0) { if (errno == EINTR) { continue; } return -1; }
+        p += r; n -= (size_t)r;
+    }
+    return 1;
+}
+
+static int write_n(int fd, const void *buf, size_t n)
+{
+    const uint8_t *p = buf;
+    while (n) {
+        ssize_t r = write(fd, p, n);
+        if (r <= 0) { if (r < 0 && errno == EINTR) { continue; } return -1; }
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
+/* atomically write one framed message to the current connection */
+static void send_frame(const uint8_t *payload, uint32_t len)
+{
+    int fd = atomic_load(&conn_fd);
+    if (fd < 0) { return; }
+    uint8_t hdr[4];
+    le32enc(hdr, len);
+    g_mutex_lock(&wlock);
+    if (write_n(fd, hdr, 4) == 0) {
+        write_n(fd, payload, len);
+    }
+    g_mutex_unlock(&wlock);
+}
+
+static void send_ba(GByteArray *b)
+{
+    send_frame(b->data, b->len);
+}
+
+static void reply_ok_empty(void)
+{
+    GByteArray *b = g_byte_array_new();
+    p8(b, RSP_OK);
+    send_ba(b);
+    g_byte_array_free(b, TRUE);
+}
+
+static void reply_err(uint32_t code, const char *msg)
+{
+    GByteArray *b = g_byte_array_new();
+    p8(b, RSP_ERR);
+    p32(b, code);
+    g_byte_array_append(b, (const uint8_t *)msg, strlen(msg) + 1);
+    send_ba(b);
+    g_byte_array_free(b, TRUE);
+}
+
+/* ------------------------------------------------------------------ */
+/* register helpers (must run in vCPU context)                          */
+/* ------------------------------------------------------------------ */
+
+static struct qemu_plugin_register *find_reg(const char *name)
+{
+    if (!g_regs) { return NULL; }
+    for (guint i = 0; i < g_regs->len; i++) {
+        qemu_plugin_reg_descriptor *d =
+            &g_array_index(g_regs, qemu_plugin_reg_descriptor, i);
+        if (d->name && g_ascii_strcasecmp(d->name, name) == 0) {
+            return d->handle;
+        }
+    }
+    return NULL;
+}
+
+/* read a register as a little-endian u64 (x86 control/general regs) */
+static bool read_reg_u64(const char *name, uint64_t *out)
+{
+    struct qemu_plugin_register *h = find_reg(name);
+    if (!h) { return false; }
+    GByteArray *b = g_byte_array_new();
+    bool ok = qemu_plugin_read_register(h, b);
+    uint64_t v = 0;
+    if (ok) {
+        for (guint i = 0; i < b->len && i < 8; i++) {
+            v |= (uint64_t)b->data[i] << (8 * i);
+        }
+    }
+    g_byte_array_free(b, TRUE);
+    *out = v;
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* x86_64 page-table walk for LIST_MAP                                  */
+/* ------------------------------------------------------------------ */
+
+#define X86_ADDR_MASK 0x000ffffffffff000ULL
+
+typedef struct {
+    uint64_t gva, gpa, size;
+    uint32_t flags;             /* 1=P 2=W 4=U 8=NX 16=large */
+} Map;
+
+typedef struct {
+    GArray *maps;
+    int levels;                 /* 4 or 5 */
+    uint32_t budget;
+    bool have_run;
+    Map run;
+} WalkCtx;
+
+static uint64_t canon(uint64_t va, int levels)
+{
+    int bits = 12 + 9 * levels;             /* 48 or 57 */
+    if (va & (1ULL << (bits - 1))) {
+        va |= ~((1ULL << bits) - 1);
+    }
+    return va;
+}
+
+static void emit_map(WalkCtx *c, uint64_t gva, uint64_t gpa, uint64_t size,
+                     uint32_t flags)
+{
+    if (c->have_run &&
+        c->run.gva + c->run.size == gva &&
+        c->run.gpa + c->run.size == gpa &&
+        c->run.flags == flags) {
+        c->run.size += size;                /* coalesce contiguous range */
+        return;
+    }
+    if (c->have_run && c->maps->len < QMON_MAX_MAPS) {
+        g_array_append_val(c->maps, c->run);
+    }
+    c->run.gva = gva; c->run.gpa = gpa; c->run.size = size; c->run.flags = flags;
+    c->have_run = true;
+}
+
+static uint32_t pte_flags(uint64_t e, bool large)
+{
+    uint32_t f = 1;                         /* present */
+    if (e & 0x2)  { f |= 2; }               /* writable */
+    if (e & 0x4)  { f |= 4; }               /* user */
+    if (e & (1ULL << 63)) { f |= 8; }       /* NX */
+    if (large)    { f |= 16; }
+    return f;
+}
+
+static void walk(WalkCtx *c, uint64_t table_phys, int level, uint64_t va_base)
+{
+    for (int i = 0; i < 512; i++) {
+        if (c->budget == 0 || c->maps->len >= QMON_MAX_MAPS) { return; }
+        c->budget--;
+
+        GByteArray *b = g_byte_array_new();
+        enum qemu_plugin_hwaddr_operation_result r =
+            qemu_plugin_read_memory_hwaddr(table_phys + (uint64_t)i * 8, b, 8);
+        uint64_t e = (r == QEMU_PLUGIN_HWADDR_OPERATION_OK && b->len >= 8)
+                         ? le64dec(b->data) : 0;
+        g_byte_array_free(b, TRUE);
+
+        if (!(e & 1)) { continue; }         /* not present */
+
+        int shift = 12 + 9 * (level - 1);
+        uint64_t va = va_base | ((uint64_t)i << shift);
+        bool large = (level <= 3) && (e & (1ULL << 7));
+        bool leaf = (level == 1) || large;
+
+        if (leaf) {
+            uint64_t size = 1ULL << shift;
+            uint64_t gpa = (e & X86_ADDR_MASK) & ~(size - 1);
+            emit_map(c, canon(va, c->levels), gpa, size, pte_flags(e, large));
+        } else {
+            walk(c, e & X86_ADDR_MASK, level - 1, va);
+        }
+    }
+}
+
+static void do_list_map(Cmd *cmd)
+{
+    uint64_t cr0, cr3, cr4;
+    if (!read_reg_u64("cr3", &cr3)) {
+        cmd->status = 1;
+        g_strlcpy(cmd->err, "cr3 not exposed by gdb reg set", sizeof(cmd->err));
+        return;
+    }
+    read_reg_u64("cr0", &cr0);
+    read_reg_u64("cr4", &cr4);
+
+    GByteArray *out = cmd->out;
+    p8(out, RSP_OK);
+
+    if (!(cr0 & 0x80000000ULL)) {           /* paging off */
+        p32(out, 0);
+        return;
+    }
+
+    WalkCtx c = {0};
+    c.maps = g_array_new(FALSE, FALSE, sizeof(Map));
+    c.levels = (cr4 & (1ULL << 12)) ? 5 : 4;    /* CR4.LA57 */
+    c.budget = QMON_MAX_WALK;
+    walk(&c, cr3 & X86_ADDR_MASK, c.levels, 0);
+    if (c.have_run && c.maps->len < QMON_MAX_MAPS) {
+        g_array_append_val(c.maps, c.run);
+    }
+
+    p32(out, c.maps->len);
+    for (guint i = 0; i < c.maps->len; i++) {
+        Map *m = &g_array_index(c.maps, Map, i);
+        p64(out, m->gva);
+        p64(out, m->gpa);
+        p64(out, m->size);
+        p32(out, m->flags);
+    }
+    g_array_free(c.maps, TRUE);
+}
+
+/* ------------------------------------------------------------------ */
+/* command execution (runs on a vCPU thread, R_REGS available)         */
+/* ------------------------------------------------------------------ */
+
+static void do_read_regs(Cmd *cmd)
+{
+    GByteArray *out = cmd->out;
+    p8(out, RSP_OK);
+    guint nregs = g_regs ? g_regs->len : 0;
+    p32(out, nregs);
+    GByteArray *val = g_byte_array_new();
+    for (guint i = 0; i < nregs; i++) {
+        qemu_plugin_reg_descriptor *d =
+            &g_array_index(g_regs, qemu_plugin_reg_descriptor, i);
+        g_byte_array_set_size(val, 0);
+        bool ok = d->handle ? qemu_plugin_read_register(d->handle, val) : false;
+        const char *nm = d->name ? d->name : "?";
+        uint8_t nl = (uint8_t)MIN(strlen(nm), 255);
+        p8(out, nl);
+        g_byte_array_append(out, (const uint8_t *)nm, nl);
+        uint8_t w = ok ? (uint8_t)MIN(val->len, 255) : 0;
+        p8(out, w);
+        if (w) { g_byte_array_append(out, val->data, w); }
+    }
+    g_byte_array_free(val, TRUE);
+}
+
+static void do_read_vmem(Cmd *cmd)
+{
+    GByteArray *d = g_byte_array_new();
+    if (cmd->len && qemu_plugin_read_memory_vaddr(cmd->addr, d, cmd->len)) {
+        p8(cmd->out, RSP_OK);
+        p32(cmd->out, d->len);
+        g_byte_array_append(cmd->out, d->data, d->len);
+    } else {
+        cmd->status = 1;
+        g_strlcpy(cmd->err, "vaddr read failed", sizeof(cmd->err));
+    }
+    g_byte_array_free(d, TRUE);
+}
+
+static void do_read_pmem(Cmd *cmd)
+{
+    GByteArray *d = g_byte_array_new();
+    enum qemu_plugin_hwaddr_operation_result r =
+        cmd->len ? qemu_plugin_read_memory_hwaddr(cmd->addr, d, cmd->len)
+                 : QEMU_PLUGIN_HWADDR_OPERATION_ERROR;
+    if (r == QEMU_PLUGIN_HWADDR_OPERATION_OK) {
+        p8(cmd->out, RSP_OK);
+        p32(cmd->out, d->len);
+        g_byte_array_append(cmd->out, d->data, d->len);
+    } else {
+        cmd->status = 1;
+        g_snprintf(cmd->err, sizeof(cmd->err), "hwaddr read failed (%d)", r);
+    }
+    g_byte_array_free(d, TRUE);
+}
+
+static void do_xlate(Cmd *cmd)
+{
+    uint64_t hw = 0;
+    if (qemu_plugin_translate_vaddr(cmd->addr, &hw)) {
+        p8(cmd->out, RSP_OK);
+        p64(cmd->out, hw);
+    } else {
+        cmd->status = 1;
+        g_strlcpy(cmd->err, "translate failed (unmapped?)", sizeof(cmd->err));
+    }
+}
+
+static void exec_cmd(Cmd *cmd)
+{
+    switch (cmd->type) {
+    case REQ_READ_REGS: do_read_regs(cmd); break;
+    case REQ_READ_VMEM: do_read_vmem(cmd); break;
+    case REQ_READ_PMEM: do_read_pmem(cmd); break;
+    case REQ_XLATE:     do_xlate(cmd);     break;
+    case REQ_LIST_MAP:  do_list_map(cmd);  break;
+    default:
+        cmd->status = 1;
+        g_strlcpy(cmd->err, "bad command", sizeof(cmd->err));
+        break;
+    }
+}
+
+/* try to claim and run the in-flight command from this vCPU */
+static void service_one(unsigned vcpu)
+{
+    Cmd *c = NULL;
+    g_mutex_lock(&lock);
+    if (g_inflight && !g_inflight->claimed && !g_inflight->done &&
+        (g_inflight->any_vcpu || g_inflight->vcpu == vcpu)) {
+        c = g_inflight;
+        c->claimed = true;
+    }
+    g_mutex_unlock(&lock);
+
+    if (!c) { return; }
+    exec_cmd(c);
+    g_mutex_lock(&lock);
+    c->done = true;
+    g_cond_broadcast(&done_cond);
+    g_mutex_unlock(&lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* events + breakpoint freeze                                          */
+/* ------------------------------------------------------------------ */
+
+static void emit_break(unsigned vcpu, uint64_t rip, uint64_t bp)
+{
+    GByteArray *b = g_byte_array_new();
+    p8(b, EV_BREAK); p32(b, vcpu); p64(b, rip); p64(b, bp);
+    send_ba(b);
+    g_byte_array_free(b, TRUE);
+}
+
+static void emit_watch(unsigned vcpu, uint64_t rip, uint64_t addr,
+                       uint8_t store, uint8_t size, uint64_t val)
+{
+    GByteArray *b = g_byte_array_new();
+    p8(b, EV_WATCH); p32(b, vcpu); p64(b, rip); p64(b, addr);
+    p8(b, store); p8(b, size); p64(b, val);
+    send_ba(b);
+    g_byte_array_free(b, TRUE);
+}
+
+/* freeze this vCPU until the client sends CONTINUE; service reads meanwhile */
+static void block_until_continue(unsigned vcpu)
+{
+    g_mutex_lock(&lock);
+    stopped[vcpu] = true;
+    for (;;) {
+        Cmd *c = NULL;
+        bool cont = false;
+        for (;;) {
+            if (continue_req[vcpu]) { continue_req[vcpu] = false; cont = true; break; }
+            if (g_inflight && !g_inflight->claimed && !g_inflight->done &&
+                (g_inflight->any_vcpu || g_inflight->vcpu == vcpu)) {
+                c = g_inflight; c->claimed = true; break;
+            }
+            g_cond_wait(&work_cond, &lock);
+        }
+        if (cont) { break; }
+        g_mutex_unlock(&lock);
+        exec_cmd(c);
+        g_mutex_lock(&lock);
+        c->done = true;
+        g_cond_broadcast(&done_cond);
+    }
+    stopped[vcpu] = false;
+    g_mutex_unlock(&lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* instrumentation callbacks (vCPU threads)                            */
+/* ------------------------------------------------------------------ */
+
+static void pump_cb(unsigned int vcpu, void *udata)
+{
+    (void)udata;
+    if (atomic_load(&pending)) {
+        service_one(vcpu);
+    }
+}
+
+static void bp_cb(unsigned int vcpu, void *udata)
+{
+    if (atomic_load(&n_bp) == 0) { return; }
+    uint64_t pc = (uint64_t)(uintptr_t)udata;
+    g_mutex_lock(&lock);
+    bool hit = g_hash_table_contains(bp_set, &pc);
+    g_mutex_unlock(&lock);
+    if (!hit) { return; }
+    if (atomic_load(&conn_fd) < 0) { return; }      /* no client: don't hang */
+
+    emit_break(vcpu, pc, pc);
+    block_until_continue(vcpu);
+}
+
+static void wp_cb(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                  uint64_t vaddr, void *udata)
+{
+    (void)udata;
+    if (atomic_load(&n_wp) == 0) { return; }
+    uint32_t size = 1u << qemu_plugin_mem_size_shift(info);
+    bool store = qemu_plugin_mem_is_store(info);
+    uint8_t want = store ? 2 : 1;
+
+    bool hit = false;
+    g_mutex_lock(&lock);
+    for (guint i = 0; i < wp_list->len; i++) {
+        Watch *w = &g_array_index(wp_list, Watch, i);
+        if ((w->rw & want) &&
+            vaddr < w->addr + w->len && w->addr < vaddr + size) {
+            hit = true;
+            break;
+        }
+    }
+    g_mutex_unlock(&lock);
+    if (!hit) { return; }
+
+    qemu_plugin_mem_value mv = qemu_plugin_mem_get_value(info);
+    uint64_t val = 0;
+    switch (mv.type) {
+    case QEMU_PLUGIN_MEM_VALUE_U8:   val = mv.data.u8;  break;
+    case QEMU_PLUGIN_MEM_VALUE_U16:  val = mv.data.u16; break;
+    case QEMU_PLUGIN_MEM_VALUE_U32:  val = mv.data.u32; break;
+    case QEMU_PLUGIN_MEM_VALUE_U64:  val = mv.data.u64; break;
+    case QEMU_PLUGIN_MEM_VALUE_U128: val = mv.data.u128.low; break;
+    default: break;
+    }
+    uint64_t rip = 0;
+    read_reg_u64("rip", &rip);
+    emit_watch(vcpu, rip, vaddr, store, (uint8_t)size, val);
+}
+
+static void vcpu_init_cb(unsigned int vcpu, void *udata)
+{
+    (void)vcpu; (void)udata;
+    g_mutex_lock(&lock);
+    if (!g_regs_done) {
+        g_regs = qemu_plugin_get_registers();   /* current vCPU; handles are shared */
+        g_regs_done = true;
+    }
+    g_mutex_unlock(&lock);
+}
+
+static void tb_trans_cb(struct qemu_plugin_tb *tb, void *udata)
+{
+    (void)udata;
+    /* the request pump: one cheap callback per executed block */
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, pump_cb,
+                                         QEMU_PLUGIN_CB_R_REGS, NULL);
+
+    if (!feat_bp && !feat_wp) { return; }
+
+    size_t n = qemu_plugin_tb_n_insns(tb);
+    for (size_t i = 0; i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        if (feat_bp) {
+            uint64_t va = qemu_plugin_insn_vaddr(insn);
+            qemu_plugin_register_vcpu_insn_exec_cb(
+                insn, bp_cb, QEMU_PLUGIN_CB_R_REGS, (void *)(uintptr_t)va);
+        }
+        if (feat_wp) {
+            qemu_plugin_register_vcpu_mem_cb(
+                insn, wp_cb, QEMU_PLUGIN_CB_R_REGS, QEMU_PLUGIN_MEM_RW, NULL);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* request handling (I/O thread)                                       */
+/* ------------------------------------------------------------------ */
+
+/* post a vCPU-context command and wait for a vCPU thread to run it */
+static void run_vcpu_cmd(Cmd *cmd)
+{
+    cmd->out = g_byte_array_new();
+    g_mutex_lock(&lock);
+    g_inflight = cmd;
+    atomic_store(&pending, 1);
+    g_cond_broadcast(&work_cond);           /* wake any frozen vCPU */
+
+    gint64 deadline = g_get_monotonic_time() + QMON_REQ_TIMEOUT_US;
+    while (!cmd->done) {
+        if (!g_cond_wait_until(&done_cond, &lock, deadline)) {
+            if (!cmd->claimed) { break; }   /* nobody started it: abandon */
+            /* claimed and in progress: wait a little longer, never UAF */
+            deadline = g_get_monotonic_time() + 500 * 1000;
+        }
+    }
+    bool timed_out = !cmd->done;
+    g_inflight = NULL;
+    atomic_store(&pending, 0);
+    g_mutex_unlock(&lock);
+
+    if (timed_out) {
+        reply_err(2, "timeout: target vCPU not executing (idle/halted?)");
+    } else if (cmd->status) {
+        reply_err(1, cmd->err);
+    } else {
+        send_ba(cmd->out);
+    }
+    g_byte_array_free(cmd->out, TRUE);
+}
+
+static void add_bp(uint64_t addr)
+{
+    g_mutex_lock(&lock);
+    if (!g_hash_table_contains(bp_set, &addr)) {
+        gint64 *k = g_new(gint64, 1);
+        *k = (gint64)addr;
+        g_hash_table_insert(bp_set, k, GINT_TO_POINTER(1));
+        atomic_store(&n_bp, (int)g_hash_table_size(bp_set));
+    }
+    g_mutex_unlock(&lock);
+}
+
+static void clr_bp(uint64_t addr)
+{
+    g_mutex_lock(&lock);
+    g_hash_table_remove(bp_set, &addr);
+    atomic_store(&n_bp, (int)g_hash_table_size(bp_set));
+    g_mutex_unlock(&lock);
+}
+
+static void add_wp(uint64_t addr, uint64_t len, uint8_t rw)
+{
+    Watch w = { addr, len ? len : 1, rw ? rw : 3 };
+    g_mutex_lock(&lock);
+    g_array_append_val(wp_list, w);
+    atomic_store(&n_wp, (int)wp_list->len);
+    g_mutex_unlock(&lock);
+}
+
+static void clr_wp(uint64_t addr)
+{
+    g_mutex_lock(&lock);
+    for (guint i = 0; i < wp_list->len; i++) {
+        if (g_array_index(wp_list, Watch, i).addr == addr) {
+            g_array_remove_index(wp_list, i);
+            break;
+        }
+    }
+    atomic_store(&n_wp, (int)wp_list->len);
+    g_mutex_unlock(&lock);
+}
+
+static void do_continue(uint32_t vcpu)
+{
+    g_mutex_lock(&lock);
+    for (int i = 0; i < g_max_vcpus; i++) {
+        if ((vcpu == 0xffffffffu || (uint32_t)i == vcpu) && stopped[i]) {
+            continue_req[i] = true;
+        }
+    }
+    g_cond_broadcast(&work_cond);
+    g_mutex_unlock(&lock);
+}
+
+static void handle_request(const uint8_t *buf, size_t len)
+{
+    Rd r = { buf, len, 0, false };
+    uint8_t type = g8(&r);
+
+    switch (type) {
+    case REQ_PING:
+        reply_ok_empty();
+        break;
+    case REQ_READ_REGS:
+    case REQ_READ_VMEM:
+    case REQ_READ_PMEM:
+    case REQ_XLATE:
+    case REQ_LIST_MAP: {
+        Cmd cmd = {0};
+        cmd.type = type;
+        cmd.vcpu = g32(&r);
+        if (type == REQ_READ_VMEM || type == REQ_READ_PMEM) {
+            cmd.addr = g64(&r);
+            cmd.len = g32(&r);
+            if (cmd.len > QMON_MAX_FRAME) { cmd.len = QMON_MAX_FRAME; }
+        } else if (type == REQ_XLATE) {
+            cmd.addr = g64(&r);
+        }
+        cmd.any_vcpu = (type == REQ_READ_PMEM);
+        if (r.err) { reply_err(3, "short request"); break; }
+        run_vcpu_cmd(&cmd);
+        break;
+    }
+    case REQ_SET_BREAK: { uint64_t a = g64(&r); if (!r.err) { add_bp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_CLR_BREAK: { uint64_t a = g64(&r); if (!r.err) { clr_bp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_SET_WATCH: {
+        uint64_t a = g64(&r), l = g64(&r); uint8_t rw = g8(&r);
+        if (!r.err) { add_wp(a, l, rw); reply_ok_empty(); } else { reply_err(3, "short"); }
+        break;
+    }
+    case REQ_CLR_WATCH: { uint64_t a = g64(&r); if (!r.err) { clr_wp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_CONTINUE:  { uint32_t v = g32(&r); if (!r.err) { do_continue(v); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    default:
+        reply_err(4, "unknown request");
+        break;
+    }
+}
+
+/* on client disconnect: disarm everything and release frozen vCPUs */
+static void connection_cleanup(void)
+{
+    g_mutex_lock(&lock);
+    g_hash_table_remove_all(bp_set);
+    g_array_set_size(wp_list, 0);
+    atomic_store(&n_bp, 0);
+    atomic_store(&n_wp, 0);
+    for (int i = 0; i < g_max_vcpus; i++) {
+        continue_req[i] = stopped[i];
+    }
+    g_cond_broadcast(&work_cond);
+    g_mutex_unlock(&lock);
+}
+
+static void serve(int fd)
+{
+    atomic_store(&conn_fd, fd);
+    for (;;) {
+        uint8_t hdr[4];
+        if (read_n(fd, hdr, 4) <= 0) { break; }
+        uint32_t len = le32dec(hdr);
+        if (len < 1 || len > QMON_MAX_FRAME) { break; }
+        uint8_t *buf = g_malloc(len);
+        if (read_n(fd, buf, len) <= 0) { g_free(buf); break; }
+        handle_request(buf, len);
+        g_free(buf);
+    }
+    atomic_store(&conn_fd, -1);
+    connection_cleanup();
+}
+
+static void *io_thread_fn(void *arg)
+{
+    (void)arg;
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0) { perror("qmon: socket"); return NULL; }
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    g_strlcpy(sa.sun_path, g_sock_path, sizeof(sa.sun_path));
+    unlink(g_sock_path);
+    if (bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        perror("qmon: bind"); close(lfd); return NULL;
+    }
+    if (listen(lfd, 1) < 0) {
+        perror("qmon: listen"); close(lfd); return NULL;
+    }
+    {
+        char msg[256];
+        g_snprintf(msg, sizeof(msg), "qmon: listening on %s\n", g_sock_path);
+        qemu_plugin_outs(msg);
+    }
+
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) { if (errno == EINTR) { continue; } break; }
+        serve(cfd);
+        close(cfd);
+    }
+    close(lfd);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* lifecycle                                                           */
+/* ------------------------------------------------------------------ */
+
+static void plugin_exit(void *udata)
+{
+    (void)udata;
+    if (g_sock_path) { unlink(g_sock_path); }
+}
+
+QEMU_PLUGIN_EXPORT
+int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
+                        int argc, char **argv)
+{
+    if (!info->system_emulation) {
+        fprintf(stderr, "qmon: only supports full-system emulation\n");
+        return -1;
+    }
+
+    g_sock_path = g_strdup("/tmp/qmon.sock");
+    for (int i = 0; i < argc; i++) {
+        char *opt = argv[i];
+        g_auto(GStrv) kv = g_strsplit(opt, "=", 2);
+        if (g_strcmp0(kv[0], "sock") == 0 && kv[1]) {
+            g_free(g_sock_path);
+            g_sock_path = g_strdup(kv[1]);
+        } else if (g_strcmp0(kv[0], "bp") == 0 && kv[1]) {
+            qemu_plugin_bool_parse("bp", kv[1], &feat_bp);
+        } else if (g_strcmp0(kv[0], "wp") == 0 && kv[1]) {
+            qemu_plugin_bool_parse("wp", kv[1], &feat_wp);
+        } else {
+            fprintf(stderr, "qmon: ignoring unknown arg '%s'\n", opt);
+        }
+    }
+
+    g_id = id;
+    g_max_vcpus = info->system.max_vcpus > 0 ? info->system.max_vcpus : 1;
+    stopped = g_new0(bool, g_max_vcpus);
+    continue_req = g_new0(bool, g_max_vcpus);
+    bp_set = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+    wp_list = g_array_new(FALSE, FALSE, sizeof(Watch));
+    g_mutex_init(&lock);
+    g_mutex_init(&wlock);
+    g_cond_init(&done_cond);
+    g_cond_init(&work_cond);
+
+    qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb, NULL);
+    qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans_cb, NULL);
+    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, io_thread_fn, NULL) != 0) {
+        fprintf(stderr, "qmon: pthread_create failed\n");
+        return -1;
+    }
+    pthread_detach(th);
+    return 0;
+}
