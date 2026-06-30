@@ -61,6 +61,7 @@ qmon_boot() {
     QPID=$!
     exec 3>"$FIFO"      # hold console write end open so PID-1 bash doesn't exit
     QMON_OWNED=1
+    trap qmon_teardown EXIT   # set now, so a boot failure below still cleans up
 
     local i
     for i in $(seq 1 60); do [ -S "$SOCK" ] && break; sleep 1; done
@@ -78,6 +79,7 @@ qmon_boot() {
 qmon_teardown() {
     [ "$QMON_OWNED" = 1 ] || return 0
     kill -9 "$QPID" 2>/dev/null
+    wait "$QPID" 2>/dev/null   # reap so the disk image lock is released before we return
     exec 3>&- 2>/dev/null
     rm -rf "${FIFODIR:-}" "$SOCK" "$LOG" 2>/dev/null
 }
@@ -91,8 +93,7 @@ qmon_begin() {
         QMON_OWNED=0
     else
         qmon_repack
-        qmon_boot
-        trap qmon_teardown EXIT
+        qmon_boot          # sets the teardown trap itself (handles boot failure)
     fi
 }
 

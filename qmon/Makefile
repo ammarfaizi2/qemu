@@ -6,6 +6,7 @@
 #   make            # build qmon.so
 #   make guest      # build the deterministic guest test program
 #   make test       # build everything and run the test suite (tests/) on 000_run
+#   make test-NAME  # run a single test standalone, e.g. make test-break
 #   make clean
 
 QEMU_ROOT  ?= $(abspath $(CURDIR)/..)
@@ -35,6 +36,11 @@ $(GUEST): target/qmon_target.c
 # Run the whole suite against a freshly-booted 000_run guest (one boot).
 test: all guest
 	./tests/run_all.sh
+
+# Run a single test standalone (boots its own guest), e.g. `make test-break`.
+# Names: ping regs vmem maps watch break ktrace.
+test-%: all guest
+	./tests/test_$*.sh
 
 verify: test          # back-compat alias
 
