@@ -12,7 +12,7 @@ trap qmon_teardown EXIT
 export QMON_SOCK="$SOCK"      # tell child test scripts to reuse this guest
 
 fails=0
-for name in ping regs vmem maps watch break ktrace; do
+for name in ping regs slide vmem maps watch break ktrace; do
     echo "===== test_$name ====="
     if bash "$TESTS_DIR/test_$name.sh"; then
         :

@@ -48,7 +48,7 @@ Plugin arguments (`-plugin qmon.so,key=val,...`):
 | `bp`      | `on`                      | instrument instructions for breakpoints (objective 5)       |
 | `wp`      | `on`                      | instrument memory ops for watchpoints (objective 4)         |
 | `ksyms`   | (none)                    | `System.map` or kallsyms file → symbolize call traces       |
-| `slide`   | `0`                       | KASLR text slide (`runtime = linktime + slide`)             |
+| `slide`   | `auto`                    | KASLR text slide; `auto` detects it, or force a value        |
 | `btf`     | `/sys/kernel/btf/vmlinux` | BTF for `task_struct` `comm`/`pid` offsets (current process)|
 | `comm_off`/`pid_off` | (from BTF)     | override `task_struct` member offsets if BTF is unavailable  |
 
@@ -87,6 +87,7 @@ REQ_XLATE      0x13  u32 vcpu, u64 addr
 REQ_LIST_MAP   0x14  u32 vcpu
 REQ_CONTEXT    0x15  u32 vcpu
 REQ_BACKTRACE  0x16  u32 vcpu, u32 max_frames
+REQ_SLIDE      0x17  ()                          (-> u8 calibrated, u64 slide)
 REQ_SET_BREAK  0x20  u64 addr
 REQ_CLR_BREAK  0x21  u64 addr
 REQ_SET_WATCH  0x22  u64 addr, u64 len, u8 rw   (1=R,2=W,3=RW)
@@ -156,12 +157,17 @@ context : ring0/kernel in hrtimer_nanosleep+0x0 | qmon_target(pid 131)
   #4 entry_SYSCALL_64_after_hwframe+0x6c
 ```
 
+**KASLR** is handled automatically: the plugin finds the text slide by locating the
+`linux_banner` string (`"Linux version …"`, which moves with the kernel image) — it appears
+at `linktime(linux_banner) + slide` only for the true slide. Calibration runs on a vCPU
+thread in ring0 (where the kernel CR3 maps kernel rodata), throttled so it isn't a per-TB
+cost, and is one-shot. Query it with `client.py <sock> slide`; force a value or disable
+detection with `slide=0x…`. So `nokaslr` is **not** required. (The per-CPU `current_task`
+and `gs_base` are not text-slid, so the process readout is unaffected.)
+
 Requirements/assumptions: the kernel is built with `CONFIG_FRAME_POINTER=y` (exact RBP
 unwind; an ORC-only kernel would need a different unwinder). The `System.map`/BTF must
-match the running kernel. For KASLR, either boot the guest with `nokaslr` (text slide 0,
-what the test suite does) or pass the correct `slide=`. The per-CPU `current_task` value and
-the per-CPU base (`gs_base`) are not KASLR-text-slid, so the process readout works either
-way once the right gs base is used.
+match the running kernel, and `System.map` must contain `linux_banner` for auto-slide.
 
 ## Test suite (`tests/`)
 
@@ -199,6 +205,7 @@ connection.
 - **`LIST_MAP`** targets x86_64 long mode and needs `cr3` in the gdb register set; if it
   isn't exposed it returns a clear error.
 - **Call trace** needs `CONFIG_FRAME_POINTER` and a matching `System.map`; on an ORC-only
-  kernel the RBP unwind degrades (future work: ORC / heuristic scan). KASLR needs `nokaslr`
-  or a correct `slide=` (auto-slide detection is future work).
+  kernel the RBP unwind degrades (future work: ORC / heuristic scan).
+- **KASLR** slide is auto-detected via `linux_banner` (no `nokaslr` needed); force it with
+  `slide=0x…` if your `System.map` lacks that symbol.
 - **One client** connection at a time. Multi-client and a richer client are future work.

@@ -2,7 +2,9 @@
 
 End-to-end tests for `qmon.so`, run against the bundled `000_run` TCG appliance
 (host kernel). Each test boots the guest with the plugin, drives `client.py`, and
-checks one capability.
+checks one capability. The guest boots under **real KASLR** — the plugin auto-detects
+the kernel text slide (`test_slide`), and `test_ktrace` proves it end-to-end by
+symbolizing a kernel backtrace at the slid addresses.
 
 ## Running
 
@@ -30,6 +32,7 @@ workload), and a `qemu-system-x86_64` built with TCG plugins (the in-tree
 |-------------------|------------------------------------------------------------------------|
 | `test_ping.sh`    | plugin answers on its socket                                           |
 | `test_regs.sh`    | obj 1 — dump CPU registers (`rip`/`cr3` present)                       |
+| `test_slide.sh`   | KASLR text slide auto-detected (calibrated, 2 MB-aligned)              |
 | `test_vmem.sh`    | obj 2/3 — read guest VA memory; cross-check `gva→gpa` via `pmem`       |
 | `test_maps.sh`    | obj 3 — page-table walk returns guest virt↔phys mappings              |
 | `test_watch.sh`   | obj 4 — watchpoint on `g_counter`, observe write events                |

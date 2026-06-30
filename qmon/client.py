@@ -18,7 +18,10 @@ Usage:
   client.py SOCK clrwatch ADDR
   client.py SOCK cont  [VCPU|all]
   client.py SOCK listen [SECONDS]
-  client.py SOCK test NAME [args]                   # ping|regs|vmem|maps|watch|break|ktrace
+  client.py SOCK context [VCPU]   |  backtrace [VCPU]   # ring/func/process; call trace
+  client.py SOCK resolve NAME     |  sym ADDR           # kernel symbol <-> addr
+  client.py SOCK slide                              # detected KASLR text slide
+  client.py SOCK test NAME [args]                   # ping|regs|slide|vmem|maps|watch|break|ktrace
   client.py SOCK test break MARKER_VA               # watch/break take a target VA
   client.py SOCK test all MARKER_VA COUNTER_VA      # run the whole suite (one connection)
 Numbers may be decimal or 0x-hex.
@@ -31,6 +34,7 @@ import time
 # request types
 REQ_PING, REQ_READ_REGS, REQ_READ_VMEM, REQ_READ_PMEM = 0x01, 0x10, 0x11, 0x12
 REQ_XLATE, REQ_LIST_MAP, REQ_CONTEXT, REQ_BACKTRACE = 0x13, 0x14, 0x15, 0x16
+REQ_SLIDE = 0x17
 REQ_SET_BREAK, REQ_CLR_BREAK, REQ_SET_WATCH, REQ_CLR_WATCH = 0x20, 0x21, 0x22, 0x23
 REQ_RESOLVE, REQ_SYM, REQ_CONTINUE = 0x24, 0x25, 0x30
 # response / event types
@@ -199,6 +203,10 @@ class Qmon:
         (nm, off), _ = _sym(b, 0)
         return nm, off
 
+    def slide(self):
+        _, b = self.request(struct.pack("<B", REQ_SLIDE))
+        return bool(b[0]), struct.unpack_from("<Q", b, 1)[0]
+
     def context(self, vcpu=0):
         _, b = self.request(struct.pack("<BI", REQ_CONTEXT, vcpu))
         ctx, _ = _context(b, 0)
@@ -279,6 +287,12 @@ def tc_regs(q, ck):
     rip, cr3 = r.get("rip"), r.get("cr3")
     ck("regs: rip present", rip not in (None, 0), "rip=0x%x" % (rip or 0))
     ck("regs: cr3 present", cr3 not in (None, 0), "cr3=0x%x" % (cr3 or 0))
+
+
+def tc_slide(q, ck):
+    cal, s = q.slide()
+    ck("kaslr slide calibrated", cal, "slide=0x%x" % s)
+    ck("slide is 2MB-aligned", s % 0x200000 == 0, "0x%x" % s)
 
 
 def tc_vmem(q, ck):
@@ -375,13 +389,14 @@ def tc_ktrace(q, ck):
 TESTS = {
     "ping":   (tc_ping, 0),
     "regs":   (tc_regs, 0),
+    "slide":  (tc_slide, 0),
     "vmem":   (tc_vmem, 0),
     "maps":   (tc_maps, 0),
     "watch":  (tc_watch, 1),
     "break":  (tc_break, 1),
     "ktrace": (tc_ktrace, 0),
 }
-TEST_ORDER = ["ping", "regs", "vmem", "maps", "watch", "break", "ktrace"]
+TEST_ORDER = ["ping", "regs", "slide", "vmem", "maps", "watch", "break", "ktrace"]
 
 
 def run_test(q, name, args):
@@ -442,6 +457,9 @@ def main():
     elif cmd == "cont":
         v = 0xffffffff if (args and args[0] == "all") else (num(args[0]) if args else 0)
         q.cont(v); print("ok")
+    elif cmd == "slide":
+        cal, s = q.slide()
+        print("slide=0x%x calibrated=%s" % (s, cal))
     elif cmd == "resolve":
         print("0x%x" % q.resolve(args[0]))
     elif cmd == "sym":

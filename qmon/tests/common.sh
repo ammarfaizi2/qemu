@@ -51,12 +51,14 @@ qmon_boot() {
     FIFODIR="$(mktemp -d)"; FIFO="$FIFODIR/cons"; mkfifo "$FIFO"
     rm -f "$SOCK" "$LOG"
 
+    # Boot under real KASLR (no nokaslr): the plugin auto-detects the text slide.
+    # Set APPEND="... nokaslr" to override, or pass slide= in QMON_PLUGIN_ARGS.
     "$QEMU" -accel tcg -cpu max -smp 1 -m 1024 \
         -kernel "$APP/kernel" -initrd "$APP/initrd" \
         -drive file="$APP/root",format=raw,if=virtio,cache=unsafe \
-        -append "console=ttyS0 root=/dev/vda panic=-1 quiet nokaslr" \
+        -append "console=ttyS0 root=/dev/vda panic=-1 quiet ${APPEND:-}" \
         -nographic -no-reboot \
-        -plugin "$PLUGIN,sock=$SOCK,bp=on,wp=on,ksyms=$KSYMS,btf=$BTF" \
+        -plugin "$PLUGIN,sock=$SOCK,bp=on,wp=on,ksyms=$KSYMS,btf=$BTF${QMON_PLUGIN_ARGS:-}" \
         <"$FIFO" >"$LOG" 2>&1 &
     QPID=$!
     exec 3>"$FIFO"      # hold console write end open so PID-1 bash doesn't exit

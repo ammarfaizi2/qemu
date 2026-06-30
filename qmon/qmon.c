@@ -58,6 +58,7 @@ enum {
     REQ_LIST_MAP   = 0x14, /* u32 vcpu */
     REQ_CONTEXT    = 0x15, /* u32 vcpu -> ring + sym(rip) + pid + comm */
     REQ_BACKTRACE  = 0x16, /* u32 vcpu, u32 max -> frames */
+    REQ_SLIDE      = 0x17, /* () -> u8 calibrated, u64 kaslr text slide */
     REQ_SET_BREAK  = 0x20, /* u64 addr */
     REQ_CLR_BREAK  = 0x21, /* u64 addr */
     REQ_SET_WATCH  = 0x22, /* u64 addr, u64 len, u8 rw (1=R,2=W,3=RW) */
@@ -295,6 +296,10 @@ static bool read_reg_u64(const char *name, uint64_t *out)
 #define QMON_THREAD_SIZE 16384
 #define QMON_MAX_FRAMES  64
 
+/* KASLR text slide is a multiple of 2 MB within the kernel randomization range. */
+#define QMON_KASLR_STEP 0x200000ULL
+#define QMON_KASLR_MAX  0x40000000ULL   /* 1 GiB search window */
+
 typedef struct { uint64_t addr; char *name; } Ksym;
 
 static Ksym    *g_ksyms;            /* sorted ascending by link-time addr */
@@ -302,6 +307,10 @@ static size_t   g_nksyms;
 static char    *g_ksyms_path;
 static char    *g_btf_path;
 static uint64_t g_text_slide;       /* runtime = link-time + slide (KASLR) */
+static uint64_t g_anchor_va;        /* link-time addr of linux_banner (slide anchor) */
+static _Atomic int g_calibrated;    /* 1 once g_text_slide is known/valid */
+static _Atomic unsigned long g_tick;   /* TB counter, throttles calibration */
+static bool     g_slide_forced;     /* slide= passed -> skip auto-detection */
 static uint64_t g_stext, g_etext;   /* link-time text bounds (0 if unknown) */
 static uint64_t g_current_off;      /* per-cpu offset of current_task */
 static bool     g_have_current;
@@ -386,6 +395,7 @@ static void ksyms_load(const char *path)
     if (!ksym_value("_stext", &g_stext)) { (void)ksym_value("_text", &g_stext); }
     (void)ksym_value("_etext", &g_etext);
     g_have_current = ksym_value("current_task", &g_current_off);
+    (void)ksym_value("linux_banner", &g_anchor_va);   /* KASLR slide anchor */
 
     char msg[200];
     g_snprintf(msg, sizeof(msg),
@@ -500,9 +510,36 @@ static void put_sym(GByteArray *b, uint64_t addr)
     p64(b, ok ? off : addr);
 }
 
+/* Auto-detect the KASLR slide via a content anchor: the linux_banner string
+ * ("Linux version ...") moves with the kernel image, so it appears at
+ * link-time(linux_banner) + slide only for the true slide.  Runs on a vCPU
+ * thread in ring0 (kernel mappings present); one-shot, self-gating. */
+static void try_calibrate_slide(void)
+{
+    static const char banner[] = "Linux version ";
+    if (atomic_load(&g_calibrated) || g_slide_forced || !g_anchor_va) { return; }
+    uint64_t cs = 0;
+    read_reg_u64("cs", &cs);
+    if ((cs & 3) != 0) { return; }              /* need a kernel CR3 (ring0) */
+    for (uint64_t slide = 0; slide < QMON_KASLR_MAX; slide += QMON_KASLR_STEP) {
+        char buf[sizeof(banner) - 1];
+        if (gmem_read(g_anchor_va + slide, buf, sizeof(buf)) &&
+            memcmp(buf, banner, sizeof(buf)) == 0) {
+            g_text_slide = slide;
+            atomic_store(&g_calibrated, 1);
+            char m[96];
+            g_snprintf(m, sizeof(m), "qmon: kaslr text slide = %#llx\n",
+                       (unsigned long long)g_text_slide);
+            qemu_plugin_outs(m);
+            return;
+        }
+    }
+}
+
 /* context blob; must run on the vCPU thread with R_REGS */
 static void build_context(GByteArray *out)
 {
+    try_calibrate_slide();
     uint64_t rip = 0, cs = 0, gsb = 0, kgsb = 0;
     read_reg_u64("rip", &rip);
     read_reg_u64("cs", &cs);
@@ -537,6 +574,7 @@ static void build_context(GByteArray *out)
 /* backtrace blob; frame-pointer (RBP) chain; vCPU thread + R_REGS */
 static void build_backtrace(GByteArray *out, uint32_t max)
 {
+    try_calibrate_slide();
     if (max == 0 || max > QMON_MAX_FRAMES) { max = QMON_MAX_FRAMES; }
     uint64_t rip = 0, rsp = 0, rbp = 0;
     read_reg_u64("rip", &rip);
@@ -865,6 +903,11 @@ static void block_until_continue(unsigned vcpu)
 static void pump_cb(unsigned int vcpu, void *udata)
 {
     (void)udata;
+    /* eager KASLR calibration, throttled so it isn't a per-TB cost */
+    if (!atomic_load(&g_calibrated) && !g_slide_forced && g_anchor_va &&
+        (atomic_fetch_add(&g_tick, 1) & 0x3fff) == 0) {
+        try_calibrate_slide();
+    }
     if (atomic_load(&pending)) {
         service_one(vcpu);
     }
@@ -1088,7 +1131,19 @@ static void handle_request(const uint8_t *buf, size_t len)
     }
     case REQ_CLR_WATCH: { uint64_t a = g64(&r); if (!r.err) { clr_wp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
     case REQ_CONTINUE:  { uint32_t v = g32(&r); if (!r.err) { do_continue(v); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_SLIDE: {
+        GByteArray *b = g_byte_array_new();
+        p8(b, RSP_OK);
+        p8(b, atomic_load(&g_calibrated) ? 1 : 0);
+        p64(b, g_text_slide);
+        send_ba(b); g_byte_array_free(b, TRUE);
+        break;
+    }
     case REQ_RESOLVE: {
+        if (!g_slide_forced && !atomic_load(&g_calibrated)) {
+            reply_err(6, "kaslr slide not calibrated yet (let the guest run)");
+            break;
+        }
         /* name = remaining payload (NUL-terminated by the client) */
         char *nm = g_strndup((const char *)(buf + r.off), len - r.off);
         uint64_t v;
@@ -1217,7 +1272,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         } else if (g_strcmp0(kv[0], "btf") == 0 && kv[1]) {
             g_free(g_btf_path); g_btf_path = g_strdup(kv[1]);
         } else if (g_strcmp0(kv[0], "slide") == 0 && kv[1]) {
-            g_text_slide = g_ascii_strtoull(kv[1], NULL, 0);
+            if (g_strcmp0(kv[1], "auto") != 0) {   /* explicit value -> force it */
+                g_text_slide = g_ascii_strtoull(kv[1], NULL, 0);
+                g_slide_forced = true;
+            }
         } else if (g_strcmp0(kv[0], "comm_off") == 0 && kv[1]) {
             comm_off_ovr = g_ascii_strtoull(kv[1], NULL, 0);
         } else if (g_strcmp0(kv[0], "pid_off") == 0 && kv[1]) {
@@ -1232,6 +1290,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     btf_load(g_btf_path ? g_btf_path : "/sys/kernel/btf/vmlinux");
     if (comm_off_ovr >= 0) { g_comm_off = comm_off_ovr; }
     if (pid_off_ovr >= 0)  { g_pid_off  = pid_off_ovr; }
+    if (g_slide_forced) { atomic_store(&g_calibrated, 1); }  /* slide= is authoritative */
 
     g_id = id;
     g_max_vcpus = info->system.max_vcpus > 0 ? info->system.max_vcpus : 1;
