@@ -5,7 +5,7 @@
 #
 #   make            # build qmon.so
 #   make guest      # build the deterministic guest test program
-#   make verify     # build everything and run the end-to-end test on 000_run
+#   make test       # build everything and run the test suite (tests/) on 000_run
 #   make clean
 
 QEMU_ROOT  ?= $(abspath $(CURDIR)/..)
@@ -32,10 +32,13 @@ guest: $(GUEST)
 $(GUEST): target/qmon_target.c
 	$(CC) -O2 -ggdb3 -static -no-pie -nostartfiles -fno-stack-protector -o $@ $<
 
-verify: all guest
-	./verify.sh
+# Run the whole suite against a freshly-booted 000_run guest (one boot).
+test: all guest
+	./tests/run_all.sh
+
+verify: test          # back-compat alias
 
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all guest verify clean
+.PHONY: all guest test verify clean

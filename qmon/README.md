@@ -159,20 +159,33 @@ context : ring0/kernel in hrtimer_nanosleep+0x0 | qmon_target(pid 131)
 Requirements/assumptions: the kernel is built with `CONFIG_FRAME_POINTER=y` (exact RBP
 unwind; an ORC-only kernel would need a different unwinder). The `System.map`/BTF must
 match the running kernel. For KASLR, either boot the guest with `nokaslr` (text slide 0,
-what `verify.sh` does) or pass the correct `slide=`. The per-CPU `current_task` value and
+what the test suite does) or pass the correct `slide=`. The per-CPU `current_task` value and
 the per-CPU base (`gs_base`) are not KASLR-text-slid, so the process readout works either
 way once the right gs base is used.
 
-## Verify on the bundled appliance
+## Test suite (`tests/`)
 
 ```sh
-make verify          # builds qmon.so + a guest workload, boots 000_run, runs all 5 checks
+make test                 # boots 000_run once, runs every tests/test_*.sh, prints PASS/FAIL
+./tests/test_break.sh     # run a single test standalone (boots its own guest)
 ```
 
-`verify.sh` builds `target/qmon_target.c` (a freestanding, fixed-VA loop that bumps a
-global and calls `marker()`), drops it into the appliance, boots `../000_run/start.sh`
-with the plugin, then uses `client.py selftest` to exercise every objective and print
-PASS/FAIL. Console/boot output is captured to `../000_run/qemu.log`.
+The suite uses `target/qmon_target.c` — a freestanding, fixed-VA loop that bumps a global
+(`g_counter`) and calls `marker()`, then `nanosleep`s — injected into the appliance image.
+Layout:
+
+- `tests/common.sh` — sourced helpers (DRY): build, loop-mount the workload in, boot the
+  guest with the plugin (`bp=on,wp=on,ksyms=,btf=`, `nokaslr`), launch the workload, tear
+  down. `qmon_begin` reuses a shared guest when `QMON_SOCK` is set, else boots its own.
+- `tests/test_<name>.sh` — one per case (`ping`, `regs`, `vmem`, `maps`, `watch`, `break`,
+  `ktrace`); each sources `common.sh` and runs `client.py test <name>` (one connection).
+- `tests/run_all.sh` — what `make test` runs: boot one shared guest, run all tests, exit
+  non-zero on any failure. Per-test disconnect auto-disarms breakpoints, so tests stay
+  isolated. Console/boot output goes to a temp log (or `$LOG`).
+
+The assertions live in `client.py`'s `tc_*` functions (one per test); `client.py test
+<name> [args]` runs one, `client.py test all <marker> <counter>` runs them in one
+connection.
 
 ## Caveats / limitations (v1)
 

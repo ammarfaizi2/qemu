@@ -18,7 +18,9 @@ Usage:
   client.py SOCK clrwatch ADDR
   client.py SOCK cont  [VCPU|all]
   client.py SOCK listen [SECONDS]
-  client.py SOCK selftest MARKER_VA COUNTER_VA      # used by verify.sh
+  client.py SOCK test NAME [args]                   # ping|regs|vmem|maps|watch|break|ktrace
+  client.py SOCK test break MARKER_VA               # watch/break take a target VA
+  client.py SOCK test all MARKER_VA COUNTER_VA      # run the whole suite (one connection)
 Numbers may be decimal or 0x-hex.
 """
 import socket
@@ -255,104 +257,149 @@ def fmt_flags(f):
 
 
 # ---------------------------------------------------------------------------
-def selftest(q, marker, counter):
-    fails = 0
+class Checker:
+    """Collects PASS/FAIL results for one test case."""
+    def __init__(self):
+        self.fails = 0
 
-    def check(name, ok, detail=""):
-        nonlocal fails
+    def __call__(self, name, ok, detail=""):
         print("[%s] %s %s" % ("PASS" if ok else "FAIL", name, detail))
         if not ok:
-            fails += 1
+            self.fails += 1
 
+
+# Each tc_* runs over a single connection `q` and reports via `ck`.
+def tc_ping(q, ck):
     q.ping()
-    check("ping", True)
+    ck("ping", True)
 
+
+def tc_regs(q, ck):
     r = q.regs(0)
-    rip = r.get("rip")
-    check("obj1 read-regs", rip is not None,
-          "rip=0x%x cr3=0x%x" % (rip or 0, r.get("cr3") or 0))
+    rip, cr3 = r.get("rip"), r.get("cr3")
+    ck("regs: rip present", rip not in (None, 0), "rip=0x%x" % (rip or 0))
+    ck("regs: cr3 present", cr3 not in (None, 0), "cr3=0x%x" % (cr3 or 0))
 
-    if rip:
-        v = q.vmem(0, rip, 16)
-        check("obj2 read-vmem", len(v) == 16, "16 bytes @rip")
-        try:
-            gpa = q.xlate(0, rip)
-            p = q.pmem(0, gpa, 16)
-            check("obj3 xlate+pmem", p == v,
-                  "rip->gpa 0x%x, vmem==pmem=%s" % (gpa, p == v))
-        except QmonError as e:
-            check("obj3 xlate+pmem", False, str(e))
 
+def tc_vmem(q, ck):
+    rip = q.regs(0).get("rip")
+    if not rip:
+        ck("vmem: have rip", False)
+        return
+    v = q.vmem(0, rip, 32)
+    ck("vmem: 32 bytes @rip", len(v) == 32, v.hex())
+    try:
+        gpa = q.xlate(0, rip)
+        p = q.pmem(0, gpa, 32)
+        ck("xlate+pmem == vmem", p == v, "rip->gpa 0x%x (gva==gpa bytes)" % gpa)
+    except QmonError as e:
+        ck("xlate+pmem == vmem", False, str(e))
+
+
+def tc_maps(q, ck):
     try:
         m = q.maps(0)
-        check("obj3 list-map", len(m) > 0, "%d ranges" % len(m))
+        ck("list-map: ranges", len(m) > 0, "%d ranges" % len(m))
         for gva, gpa, size, fl in m[:4]:
             print("        %016x -> %016x  %8x  %s" % (gva, gpa, size, fmt_flags(fl)))
     except QmonError as e:
-        check("obj3 list-map", True, "SKIP: %s" % e)   # cr3 not exposed -> skip
+        # cr3 not exposed by the gdb reg set -> treat as skip, otherwise fail
+        ck("list-map (skipped)", "cr3" in str(e), "%s" % e)
 
-    # objective 5: breakpoint on marker(), inspect while frozen, resume, re-arm
-    print("... waiting for guest target (boot may be slow under instrumentation)")
+
+def tc_break(q, ck, marker):
+    print("... break on marker 0x%x (guest target must be running)" % marker)
     q.set_break(marker)
-    hits = 0
     for attempt in range(2):
         ev = q.wait_event(240)
         if ev and ev[0] == "break" and ev[2] == marker:
-            rr = q.regs(0)
-            ok = rr.get("rip") == marker
-            check("obj5 breakpoint hit #%d" % (attempt + 1), ok,
-                  "EV_BREAK rip=0x%x  [%s]" % (ev[2], fmt_context(ev[4])))
-            hits += ok
+            ok = q.regs(0).get("rip") == marker
+            ck("breakpoint hit #%d" % (attempt + 1), ok,
+               "rip=0x%x  [%s]" % (ev[2], fmt_context(ev[4])))
             q.cont(0)
         else:
-            check("obj5 breakpoint hit #%d" % (attempt + 1), False, "no EV_BREAK: %r" % (ev,))
+            ck("breakpoint hit #%d" % (attempt + 1), False, "no EV_BREAK: %r" % (ev,))
             break
     q.clr_break(marker)
 
-    # objective 4: watchpoint on g_counter (write), observe increasing value
+
+def tc_watch(q, ck, counter):
+    print("... watch writes to g_counter 0x%x" % counter)
     q.set_watch(counter, 8, 2)   # rw=2 -> writes
     seen = []
     for _ in range(2):
         ev = q.wait_event(240)
         if ev and ev[0] == "watch" and ev[3] == counter:
             seen.append(ev[6])
-            q.cont(0)            # in case it ever stops; NOTIFY mode won't, harmless
+            q.cont(0)            # harmless; NOTIFY watch doesn't actually stop
     inc = len(seen) >= 1 and (len(seen) < 2 or seen[1] >= seen[0])
-    check("obj4 watchpoint", inc, "values=%s" % seen)
+    ck("watchpoint write events", inc, "values=%s" % seen)
     q.clr_watch(counter)
 
-    # kernel call-trace + "current context" at a specific %rip.
+
+def tc_ktrace(q, ck):
     # The target calls nanosleep ~10/s -> break in the kernel nanosleep path.
+    ksym = "hrtimer_nanosleep"
     try:
-        ksym = "hrtimer_nanosleep"
         addr = q.resolve(ksym)
-        print("... break in kernel %s @0x%x (call-trace + context)" % (ksym, addr))
-        q.set_break(addr)
-        got = None
-        for _ in range(6):
-            ev = q.wait_event(240)
-            if not (ev and ev[0] == "break"):
-                break
-            ctx, frames = ev[4], ev[5]
-            q.cont(0)
-            got = (ctx, frames)
-            if ctx["comm"] == "qmon_target":
-                break
-        q.clr_break(addr)
-        if got:
-            ctx, frames = got
-            funcs = [f[1] for f in frames]
-            print("    context : %s" % fmt_context(ctx))
-            print(fmt_frames(frames))
-            check("ctx ring0 + function", ctx["ring"] == 0 and ctx["func"] == ksym, ctx["func"])
-            check("ctx current process", ctx["comm"] == "qmon_target",
-                  "comm=%r pid=%d" % (ctx["comm"], ctx["pid"]))
-            check("backtrace reaches do_syscall_64", "do_syscall_64" in funcs,
-                  " <- ".join(funcs[:6]))
-        else:
-            check("kernel call-trace", False, "no EV_BREAK at %s" % ksym)
     except QmonError as e:
-        check("kernel call-trace", True, "SKIP (no ksyms loaded?): %s" % e)
+        ck("kernel call-trace", False, "resolve %s failed (ksyms loaded?): %s" % (ksym, e))
+        return
+    print("... break in kernel %s @0x%x" % (ksym, addr))
+    q.set_break(addr)
+    got = None
+    for _ in range(6):
+        ev = q.wait_event(240)
+        if not (ev and ev[0] == "break"):
+            break
+        ctx, frames = ev[4], ev[5]
+        q.cont(0)
+        got = (ctx, frames)
+        if ctx["comm"] == "qmon_target":
+            break
+    q.clr_break(addr)
+    if not got:
+        ck("kernel call-trace", False, "no EV_BREAK at %s" % ksym)
+        return
+    ctx, frames = got
+    funcs = [f[1] for f in frames]
+    print("    context : %s" % fmt_context(ctx))
+    print(fmt_frames(frames))
+    ck("ctx ring0 + function", ctx["ring"] == 0 and ctx["func"] == ksym, ctx["func"])
+    ck("ctx current process", ctx["comm"] == "qmon_target",
+       "comm=%r pid=%d" % (ctx["comm"], ctx["pid"]))
+    ck("backtrace reaches do_syscall_64", "do_syscall_64" in funcs, " <- ".join(funcs[:6]))
+
+
+# name -> (function, number of positional args it needs)
+TESTS = {
+    "ping":   (tc_ping, 0),
+    "regs":   (tc_regs, 0),
+    "vmem":   (tc_vmem, 0),
+    "maps":   (tc_maps, 0),
+    "watch":  (tc_watch, 1),
+    "break":  (tc_break, 1),
+    "ktrace": (tc_ktrace, 0),
+}
+TEST_ORDER = ["ping", "regs", "vmem", "maps", "watch", "break", "ktrace"]
+
+
+def run_test(q, name, args):
+    ck = Checker()
+    fn, nargs = TESTS[name]
+    fn(q, ck, *args[:nargs])
+    return 1 if ck.fails else 0
+
+
+def run_all_tests(q, marker, counter):
+    ck = Checker()
+    argmap = {"break": [marker], "watch": [counter]}
+    for name in TEST_ORDER:
+        print("----- %s -----" % name)
+        fn, nargs = TESTS[name]
+        fn(q, ck, *argmap.get(name, []))
+    print("\n%s (%d failure(s))" % ("ALL GOOD" if ck.fails == 0 else "FAILURES", ck.fails))
+    return 1 if ck.fails else 0
 
     print("\n%s (%d failure(s))" % ("ALL GOOD" if fails == 0 else "FAILURES", fails))
     return 1 if fails else 0
@@ -416,8 +463,17 @@ def main():
             else:
                 print("EV_WATCH vcpu%d rip=0x%x %s [%d]@0x%x = 0x%x" %
                       (ev[1], ev[2], "store" if ev[4] else "load", ev[5], ev[3], ev[6]))
-    elif cmd == "selftest":
-        return selftest(q, num(args[0]), num(args[1]))
+    elif cmd == "test":
+        if not args:
+            print("usage: test <name>|all [args]; names:", ", ".join(TEST_ORDER))
+            return 2
+        name = args[0]
+        if name == "all":
+            return run_all_tests(q, num(args[1]), num(args[2]))
+        if name not in TESTS:
+            print("unknown test %r; names: %s" % (name, ", ".join(TEST_ORDER)))
+            return 2
+        return run_test(q, name, [num(a) for a in args[1:]])
     else:
         print("unknown command:", cmd); return 2
     return 0
