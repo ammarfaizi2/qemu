@@ -35,15 +35,18 @@ rm -rf "$MNT/root/root"
 cp -a "$RUN/root" "$MNT/root/root"
 sync; umount "$MNT"; rmdir "$MNT"
 
-echo "== boot guest (TCG + plugin, bp=on,wp=on) =="
+echo "== boot guest (TCG + plugin, bp=on,wp=on, kernel symbols) =="
+# nokaslr makes guest kernel text match System.map exactly (text slide 0).
+KSYMS="/boot/System.map-$(uname -r)"
+BTF="/sys/kernel/btf/vmlinux"
 FIFODIR="$(mktemp -d)"; FIFO="$FIFODIR/cons"; mkfifo "$FIFO"
 rm -f "$SOCK" "$LOG"
 "$QEMU" -accel tcg -cpu max -smp 1 -m 1024 \
     -kernel "$APP/kernel" -initrd "$APP/initrd" \
     -drive file="$APP/root",format=raw,if=virtio,cache=unsafe \
-    -append "console=ttyS0 root=/dev/vda panic=-1 quiet" \
+    -append "console=ttyS0 root=/dev/vda panic=-1 quiet nokaslr" \
     -nographic -no-reboot \
-    -plugin "$PLUGIN,sock=$SOCK,bp=on,wp=on" \
+    -plugin "$PLUGIN,sock=$SOCK,bp=on,wp=on,ksyms=$KSYMS,btf=$BTF" \
     <"$FIFO" >"$LOG" 2>&1 &
 QPID=$!
 exec 3>"$FIFO"      # hold the console write end open so PID-1 bash doesn't exit

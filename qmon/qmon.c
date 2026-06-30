@@ -56,17 +56,27 @@ enum {
     REQ_READ_PMEM  = 0x12, /* u32 vcpu, u64 addr, u32 len */
     REQ_XLATE      = 0x13, /* u32 vcpu, u64 addr */
     REQ_LIST_MAP   = 0x14, /* u32 vcpu */
+    REQ_CONTEXT    = 0x15, /* u32 vcpu -> ring + sym(rip) + pid + comm */
+    REQ_BACKTRACE  = 0x16, /* u32 vcpu, u32 max -> frames */
     REQ_SET_BREAK  = 0x20, /* u64 addr */
     REQ_CLR_BREAK  = 0x21, /* u64 addr */
     REQ_SET_WATCH  = 0x22, /* u64 addr, u64 len, u8 rw (1=R,2=W,3=RW) */
     REQ_CLR_WATCH  = 0x23, /* u64 addr */
+    REQ_RESOLVE    = 0x24, /* cstring name -> u64 runtime addr */
+    REQ_SYM        = 0x25, /* u64 addr -> sym(addr) */
     REQ_CONTINUE   = 0x30, /* u32 vcpu (0xffffffff = all) */
 
     /* responses / events (plugin -> client) */
     RSP_OK         = 0x80, /* type-specific payload */
     RSP_ERR        = 0x81, /* u32 code, cstring msg */
-    EV_BREAK       = 0xA0, /* u32 vcpu, u64 rip, u64 bp_addr */
+    EV_BREAK       = 0xA0, /* u32 vcpu, u64 rip, u64 bp_addr, <context>, <backtrace> */
     EV_WATCH       = 0xA1, /* u32 vcpu, u64 rip, u64 addr, u8 store, u8 size, u64 val */
+
+    /* sub-encodings reused by several messages:
+     *   sym      = u8 namelen, name[namelen], u64 offset
+     *   context  = u8 ring, sym(rip), u32 pid, u8 commlen, comm[commlen]
+     *   backtrace= u32 nframes, nframes x { u64 addr, sym(addr) }
+     */
 };
 
 #define QMON_MAX_FRAME (1u << 20)
@@ -279,6 +289,293 @@ static bool read_reg_u64(const char *name, uint64_t *out)
 }
 
 /* ------------------------------------------------------------------ */
+/* kernel symbols (System.map / kallsyms), BTF, unwinding, context     */
+/* ------------------------------------------------------------------ */
+
+#define QMON_THREAD_SIZE 16384
+#define QMON_MAX_FRAMES  64
+
+typedef struct { uint64_t addr; char *name; } Ksym;
+
+static Ksym    *g_ksyms;            /* sorted ascending by link-time addr */
+static size_t   g_nksyms;
+static char    *g_ksyms_path;
+static char    *g_btf_path;
+static uint64_t g_text_slide;       /* runtime = link-time + slide (KASLR) */
+static uint64_t g_stext, g_etext;   /* link-time text bounds (0 if unknown) */
+static uint64_t g_current_off;      /* per-cpu offset of current_task */
+static bool     g_have_current;
+static long     g_comm_off = -1;    /* offsetof(task_struct, comm) */
+static long     g_pid_off  = -1;    /* offsetof(task_struct, pid)  */
+
+static int ksym_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const Ksym *)a)->addr, y = ((const Ksym *)b)->addr;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* name for a runtime text address (bisect on link-time value) */
+static const char *ksym_lookup(uint64_t rt_addr, uint64_t *off)
+{
+    if (!g_nksyms) { return NULL; }
+    uint64_t key = rt_addr - g_text_slide;
+    size_t lo = 0, hi = g_nksyms;       /* first index with addr > key */
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_ksyms[mid].addr <= key) { lo = mid + 1; } else { hi = mid; }
+    }
+    if (lo == 0) { return NULL; }
+    const Ksym *s = &g_ksyms[lo - 1];
+    if (off) { *off = key - s->addr; }
+    return s->name;
+}
+
+/* link-time value of a named symbol (raw; no slide applied) */
+static bool ksym_value(const char *name, uint64_t *out)
+{
+    for (size_t i = 0; i < g_nksyms; i++) {
+        if (strcmp(g_ksyms[i].name, name) == 0) { *out = g_ksyms[i].addr; return true; }
+    }
+    return false;
+}
+
+/* runtime address of a (text) symbol, e.g. to set a breakpoint */
+static bool ksym_resolve(const char *name, uint64_t *out)
+{
+    uint64_t v;
+    if (!ksym_value(name, &v)) { return false; }
+    *out = v + g_text_slide;
+    return true;
+}
+
+static bool is_ktext(uint64_t rt_addr)
+{
+    if (g_etext <= g_stext) { return false; }
+    uint64_t lt = rt_addr - g_text_slide;
+    return lt >= g_stext && lt < g_etext;
+}
+
+/* parse "<hexaddr> <type> <name> [module]" lines (System.map / kallsyms) */
+static void ksyms_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "qmon: cannot open ksyms %s\n", path); return; }
+    size_t cap = 1 << 16, n = 0;
+    Ksym *arr = g_new(Ksym, cap);
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = NULL;
+        uint64_t addr = strtoull(line, &p, 16);
+        if (p == line) { continue; }
+        while (*p == ' ' || *p == '\t') { p++; }      /* to type */
+        while (*p && *p != ' ' && *p != '\t') { p++; } /* past type */
+        while (*p == ' ' || *p == '\t') { p++; }       /* to name */
+        char *nm = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') { p++; }
+        *p = 0;
+        if (!*nm) { continue; }
+        if (n == cap) { cap *= 2; arr = g_renew(Ksym, arr, cap); }
+        arr[n].addr = addr;
+        arr[n].name = g_strdup(nm);
+        n++;
+    }
+    fclose(f);
+    qsort(arr, n, sizeof(Ksym), ksym_cmp);
+    g_ksyms = arr; g_nksyms = n;
+
+    if (!ksym_value("_stext", &g_stext)) { (void)ksym_value("_text", &g_stext); }
+    (void)ksym_value("_etext", &g_etext);
+    g_have_current = ksym_value("current_task", &g_current_off);
+
+    char msg[200];
+    g_snprintf(msg, sizeof(msg),
+               "qmon: loaded %zu symbols from %s "
+               "(stext=%#llx etext=%#llx current_task=%#llx)\n",
+               n, path, (unsigned long long)g_stext,
+               (unsigned long long)g_etext, (unsigned long long)g_current_off);
+    qemu_plugin_outs(msg);
+}
+
+/* ---- minimal BTF reader: task_struct comm/pid byte offsets ---- */
+struct btf_hdr_min {
+    uint16_t magic; uint8_t version; uint8_t flags;
+    uint32_t hdr_len, type_off, type_len, str_off, str_len;
+};
+
+static void btf_load(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) { return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < (long)sizeof(struct btf_hdr_min)) { fclose(f); return; }
+    uint8_t *buf = g_malloc(sz);
+    if (fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); g_free(buf); return; }
+    fclose(f);
+
+    struct btf_hdr_min h;
+    memcpy(&h, buf, sizeof(h));
+    if (h.magic != 0xeB9F) { g_free(buf); return; }
+    const uint8_t *types = buf + h.hdr_len + h.type_off;
+    const uint8_t *tend  = types + h.type_len;
+    const char   *strs   = (const char *)(buf + h.hdr_len + h.str_off);
+    uint32_t str_len = h.str_len;
+
+    const uint8_t *p = types;
+    while (p + 12 <= tend) {
+        uint32_t name_off = le32dec(p);
+        uint32_t info     = le32dec(p + 4);
+        uint32_t vlen = info & 0xffff;
+        uint32_t kind = (info >> 24) & 0x1f;
+        bool kflag = (info >> 31) & 1;
+        const uint8_t *members = p + 12;
+        size_t extra;
+        switch (kind) {
+        case 1:  extra = 4; break;                  /* INT */
+        case 3:  extra = 12; break;                 /* ARRAY */
+        case 4: case 5: extra = vlen * 12; break;   /* STRUCT/UNION */
+        case 6:  extra = vlen * 8; break;           /* ENUM */
+        case 13: extra = vlen * 8; break;           /* FUNC_PROTO */
+        case 14: extra = 4; break;                  /* VAR */
+        case 15: extra = vlen * 12; break;          /* DATASEC */
+        case 17: extra = 4; break;                  /* DECL_TAG */
+        case 19: extra = vlen * 12; break;          /* ENUM64 */
+        default: extra = 0; break;
+        }
+        const char *tname = (name_off < str_len) ? strs + name_off : "";
+        if (kind == 4 && strcmp(tname, "task_struct") == 0) {
+            for (uint32_t m = 0; m < vlen; m++) {
+                const uint8_t *mp = members + (size_t)m * 12;
+                uint32_t mname  = le32dec(mp);
+                uint32_t moff   = le32dec(mp + 8);
+                uint32_t bitoff = kflag ? (moff & 0xffffff) : moff;
+                const char *mn = (mname < str_len) ? strs + mname : "";
+                if (strcmp(mn, "comm") == 0) { g_comm_off = bitoff / 8; }
+                else if (strcmp(mn, "pid") == 0) { g_pid_off = bitoff / 8; }
+            }
+            break;
+        }
+        p = members + extra;
+    }
+    g_free(buf);
+
+    char msg[128];
+    g_snprintf(msg, sizeof(msg), "qmon: btf task_struct comm@%ld pid@%ld\n",
+               g_comm_off, g_pid_off);
+    qemu_plugin_outs(msg);
+}
+
+/* ---- guest-memory reads + symbol/context/backtrace encoders ---- */
+
+static bool gmem_read(uint64_t va, void *dst, size_t n)
+{
+    GByteArray *b = g_byte_array_new();
+    bool ok = qemu_plugin_read_memory_vaddr(va, b, n) && b->len >= n;
+    if (ok) { memcpy(dst, b->data, n); }
+    g_byte_array_free(b, TRUE);
+    return ok;
+}
+
+static bool gmem_u64(uint64_t va, uint64_t *out)
+{
+    uint8_t t[8];
+    if (!gmem_read(va, t, 8)) { return false; }
+    *out = le64dec(t);
+    return true;
+}
+
+/* sym = u8 namelen, name, u64 offset (or namelen 0 + raw addr if unknown).
+ * Only addresses inside kernel text are named (avoids attributing a user or
+ * data address to the nearest kernel symbol). When text bounds are unknown,
+ * fall back to an implausible-offset guard. */
+static void put_sym(GByteArray *b, uint64_t addr)
+{
+    uint64_t off = 0;
+    const char *nm = ksym_lookup(addr, &off);
+    bool ok = nm && ((g_etext > g_stext) ? is_ktext(addr) : (off < 0x200000));
+    uint8_t nl = ok ? (uint8_t)MIN(strlen(nm), 255) : 0;
+    p8(b, nl);
+    if (nl) { g_byte_array_append(b, (const uint8_t *)nm, nl); }
+    p64(b, ok ? off : addr);
+}
+
+/* context blob; must run on the vCPU thread with R_REGS */
+static void build_context(GByteArray *out)
+{
+    uint64_t rip = 0, cs = 0, gsb = 0, kgsb = 0;
+    read_reg_u64("rip", &rip);
+    read_reg_u64("cs", &cs);
+    read_reg_u64("gs_base", &gsb);
+    if (!read_reg_u64("kernel_gs_base", &kgsb)) { read_reg_u64("k_gs_base", &kgsb); }
+
+    uint8_t ring = (uint8_t)(cs & 3);
+    p8(out, ring);
+    put_sym(out, rip);
+
+    uint32_t pid = 0;
+    char comm[16];
+    uint8_t commlen = 0;
+    if (g_have_current && g_comm_off >= 0) {
+        uint64_t pcpu = (ring == 0) ? gsb : kgsb;
+        uint64_t task = 0;
+        if (gmem_u64(pcpu + g_current_off, &task) && task) {
+            uint32_t v;
+            if (g_pid_off >= 0 && gmem_read(task + g_pid_off, &v, 4)) { pid = v; }
+            char c[16];
+            if (gmem_read(task + g_comm_off, c, 16)) {
+                commlen = (uint8_t)strnlen(c, 16);
+                memcpy(comm, c, commlen);
+            }
+        }
+    }
+    p32(out, pid);
+    p8(out, commlen);
+    if (commlen) { g_byte_array_append(out, (const uint8_t *)comm, commlen); }
+}
+
+/* backtrace blob; frame-pointer (RBP) chain; vCPU thread + R_REGS */
+static void build_backtrace(GByteArray *out, uint32_t max)
+{
+    if (max == 0 || max > QMON_MAX_FRAMES) { max = QMON_MAX_FRAMES; }
+    uint64_t rip = 0, rsp = 0, rbp = 0;
+    read_reg_u64("rip", &rip);
+    read_reg_u64("rsp", &rsp);
+    read_reg_u64("rbp", &rbp);
+
+    GArray *fr = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_array_append_val(fr, rip);
+
+    uint64_t top = (rsp | (QMON_THREAD_SIZE - 1)) + 1;
+
+    /* function-entry heuristic: caller's return addr is freshly at *rsp */
+    uint64_t off = 0;
+    const char *nm = ksym_lookup(rip, &off);
+    if (nm && off == 0) {
+        uint64_t r;
+        if (gmem_u64(rsp, &r) && is_ktext(r)) { g_array_append_val(fr, r); }
+    }
+
+    uint64_t cur = rbp;
+    while ((uint32_t)fr->len < max && cur >= rsp && cur < top) {
+        uint64_t ret, nxt;
+        if (!gmem_u64(cur + 8, &ret) || !gmem_u64(cur, &nxt)) { break; }
+        if (!is_ktext(ret)) { break; }
+        g_array_append_val(fr, ret);
+        if (nxt <= cur) { break; }
+        cur = nxt;
+    }
+
+    p32(out, fr->len);
+    for (guint i = 0; i < fr->len; i++) {
+        uint64_t a = g_array_index(fr, uint64_t, i);
+        p64(out, a);
+        put_sym(out, a);
+    }
+    g_array_free(fr, TRUE);
+}
+
+/* ------------------------------------------------------------------ */
 /* x86_64 page-table walk for LIST_MAP                                  */
 /* ------------------------------------------------------------------ */
 
@@ -480,6 +777,8 @@ static void exec_cmd(Cmd *cmd)
     case REQ_READ_PMEM: do_read_pmem(cmd); break;
     case REQ_XLATE:     do_xlate(cmd);     break;
     case REQ_LIST_MAP:  do_list_map(cmd);  break;
+    case REQ_CONTEXT:   p8(cmd->out, RSP_OK); build_context(cmd->out); break;
+    case REQ_BACKTRACE: p8(cmd->out, RSP_OK); build_backtrace(cmd->out, cmd->len); break;
     default:
         cmd->status = 1;
         g_strlcpy(cmd->err, "bad command", sizeof(cmd->err));
@@ -511,10 +810,13 @@ static void service_one(unsigned vcpu)
 /* events + breakpoint freeze                                          */
 /* ------------------------------------------------------------------ */
 
+/* called from bp_cb (vCPU thread, R_REGS): event carries context + backtrace */
 static void emit_break(unsigned vcpu, uint64_t rip, uint64_t bp)
 {
     GByteArray *b = g_byte_array_new();
     p8(b, EV_BREAK); p32(b, vcpu); p64(b, rip); p64(b, bp);
+    build_context(b);
+    build_backtrace(b, QMON_MAX_FRAMES);
     send_ba(b);
     g_byte_array_free(b, TRUE);
 }
@@ -757,7 +1059,9 @@ static void handle_request(const uint8_t *buf, size_t len)
     case REQ_READ_VMEM:
     case REQ_READ_PMEM:
     case REQ_XLATE:
-    case REQ_LIST_MAP: {
+    case REQ_LIST_MAP:
+    case REQ_CONTEXT:
+    case REQ_BACKTRACE: {
         Cmd cmd = {0};
         cmd.type = type;
         cmd.vcpu = g32(&r);
@@ -767,6 +1071,8 @@ static void handle_request(const uint8_t *buf, size_t len)
             if (cmd.len > QMON_MAX_FRAME) { cmd.len = QMON_MAX_FRAME; }
         } else if (type == REQ_XLATE) {
             cmd.addr = g64(&r);
+        } else if (type == REQ_BACKTRACE) {
+            cmd.len = g32(&r);            /* max frames */
         }
         cmd.any_vcpu = (type == REQ_READ_PMEM);
         if (r.err) { reply_err(3, "short request"); break; }
@@ -782,6 +1088,28 @@ static void handle_request(const uint8_t *buf, size_t len)
     }
     case REQ_CLR_WATCH: { uint64_t a = g64(&r); if (!r.err) { clr_wp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
     case REQ_CONTINUE:  { uint32_t v = g32(&r); if (!r.err) { do_continue(v); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_RESOLVE: {
+        /* name = remaining payload (NUL-terminated by the client) */
+        char *nm = g_strndup((const char *)(buf + r.off), len - r.off);
+        uint64_t v;
+        if (ksym_resolve(nm, &v)) {
+            GByteArray *b = g_byte_array_new();
+            p8(b, RSP_OK); p64(b, v);
+            send_ba(b); g_byte_array_free(b, TRUE);
+        } else {
+            reply_err(5, "unknown symbol");
+        }
+        g_free(nm);
+        break;
+    }
+    case REQ_SYM: {
+        uint64_t a = g64(&r);
+        if (r.err) { reply_err(3, "short"); break; }
+        GByteArray *b = g_byte_array_new();
+        p8(b, RSP_OK); put_sym(b, a);
+        send_ba(b); g_byte_array_free(b, TRUE);
+        break;
+    }
     default:
         reply_err(4, "unknown request");
         break;
@@ -873,6 +1201,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
 
     g_sock_path = g_strdup("/tmp/qmon.sock");
+    long comm_off_ovr = -1, pid_off_ovr = -1;
     for (int i = 0; i < argc; i++) {
         char *opt = argv[i];
         g_auto(GStrv) kv = g_strsplit(opt, "=", 2);
@@ -883,10 +1212,26 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             qemu_plugin_bool_parse("bp", kv[1], &feat_bp);
         } else if (g_strcmp0(kv[0], "wp") == 0 && kv[1]) {
             qemu_plugin_bool_parse("wp", kv[1], &feat_wp);
+        } else if (g_strcmp0(kv[0], "ksyms") == 0 && kv[1]) {
+            g_free(g_ksyms_path); g_ksyms_path = g_strdup(kv[1]);
+        } else if (g_strcmp0(kv[0], "btf") == 0 && kv[1]) {
+            g_free(g_btf_path); g_btf_path = g_strdup(kv[1]);
+        } else if (g_strcmp0(kv[0], "slide") == 0 && kv[1]) {
+            g_text_slide = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (g_strcmp0(kv[0], "comm_off") == 0 && kv[1]) {
+            comm_off_ovr = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (g_strcmp0(kv[0], "pid_off") == 0 && kv[1]) {
+            pid_off_ovr = g_ascii_strtoull(kv[1], NULL, 0);
         } else {
             fprintf(stderr, "qmon: ignoring unknown arg '%s'\n", opt);
         }
     }
+
+    /* kernel symbols (for backtrace/context) + struct offsets */
+    if (g_ksyms_path) { ksyms_load(g_ksyms_path); }
+    btf_load(g_btf_path ? g_btf_path : "/sys/kernel/btf/vmlinux");
+    if (comm_off_ovr >= 0) { g_comm_off = comm_off_ovr; }
+    if (pid_off_ovr >= 0)  { g_pid_off  = pid_off_ovr; }
 
     g_id = id;
     g_max_vcpus = info->system.max_vcpus > 0 ? info->system.max_vcpus : 1;

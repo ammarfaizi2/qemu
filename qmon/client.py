@@ -28,15 +28,69 @@ import time
 
 # request types
 REQ_PING, REQ_READ_REGS, REQ_READ_VMEM, REQ_READ_PMEM = 0x01, 0x10, 0x11, 0x12
-REQ_XLATE, REQ_LIST_MAP = 0x13, 0x14
-REQ_SET_BREAK, REQ_CLR_BREAK, REQ_SET_WATCH, REQ_CLR_WATCH, REQ_CONTINUE = \
-    0x20, 0x21, 0x22, 0x23, 0x30
+REQ_XLATE, REQ_LIST_MAP, REQ_CONTEXT, REQ_BACKTRACE = 0x13, 0x14, 0x15, 0x16
+REQ_SET_BREAK, REQ_CLR_BREAK, REQ_SET_WATCH, REQ_CLR_WATCH = 0x20, 0x21, 0x22, 0x23
+REQ_RESOLVE, REQ_SYM, REQ_CONTINUE = 0x24, 0x25, 0x30
 # response / event types
 RSP_OK, RSP_ERR, EV_BREAK, EV_WATCH = 0x80, 0x81, 0xA0, 0xA1
 
 
 class QmonError(Exception):
     pass
+
+
+# ---- sub-encoding readers: return (value, new_offset) ----
+def _u8(b, o):
+    return b[o], o + 1
+
+
+def _u32(b, o):
+    return struct.unpack_from("<I", b, o)[0], o + 4
+
+
+def _u64(b, o):
+    return struct.unpack_from("<Q", b, o)[0], o + 8
+
+
+def _sym(b, o):
+    nl, o = _u8(b, o)
+    name = b[o:o + nl].decode("latin1"); o += nl
+    off, o = _u64(b, o)
+    return (name, off), o
+
+
+def _context(b, o):
+    ring, o = _u8(b, o)
+    (fn, foff), o = _sym(b, o)
+    pid, o = _u32(b, o)
+    cl, o = _u8(b, o)
+    comm = b[o:o + cl].decode("latin1"); o += cl
+    return {"ring": ring, "func": fn, "off": foff, "pid": pid, "comm": comm}, o
+
+
+def _backtrace(b, o):
+    n, o = _u32(b, o)
+    frames = []
+    for _ in range(n):
+        addr, o = _u64(b, o)
+        (nm, off), o = _sym(b, o)
+        frames.append((addr, nm, off))
+    return frames, o
+
+
+def fmt_context(c):
+    ringname = {0: "ring0/kernel", 3: "ring3/user"}.get(c["ring"], "ring%d" % c["ring"])
+    where = "%s+0x%x" % (c["func"], c["off"]) if c["func"] else "0x%x" % c["off"]
+    who = " | %s(pid %d)" % (c["comm"], c["pid"]) if c["comm"] else ""
+    return "%s in %s%s" % (ringname, where, who)
+
+
+def fmt_frames(frames):
+    out = []
+    for i, (addr, nm, off) in enumerate(frames):
+        sym = "%s+0x%x" % (nm, off) if nm else "?"
+        out.append("  #%-2d 0x%016x  %s" % (i, addr, sym))
+    return "\n".join(out)
 
 
 class Qmon:
@@ -133,14 +187,46 @@ class Qmon:
     def cont(self, vcpu=0):
         self.request(struct.pack("<BI", REQ_CONTINUE, vcpu & 0xffffffff))
 
+    # ---- symbols / context / unwinding ----
+    def resolve(self, name):
+        _, b = self.request(struct.pack("<B", REQ_RESOLVE) + name.encode() + b"\0")
+        return struct.unpack("<Q", b[:8])[0]
+
+    def sym(self, addr):
+        _, b = self.request(struct.pack("<BQ", REQ_SYM, addr))
+        (nm, off), _ = _sym(b, 0)
+        return nm, off
+
+    def context(self, vcpu=0):
+        _, b = self.request(struct.pack("<BI", REQ_CONTEXT, vcpu))
+        ctx, _ = _context(b, 0)
+        return ctx
+
+    def backtrace(self, vcpu=0, maxframes=64):
+        _, b = self.request(struct.pack("<BII", REQ_BACKTRACE, vcpu, maxframes))
+        fr, _ = _backtrace(b, 0)
+        return fr
+
+    def break_at(self, name_or_addr):
+        """Set a breakpoint by symbol name or numeric address."""
+        try:
+            addr = int(name_or_addr, 0) if isinstance(name_or_addr, str) else int(name_or_addr)
+        except ValueError:
+            addr = self.resolve(name_or_addr)
+        self.set_break(addr)
+        return addr
+
     def wait_event(self, timeout):
         self.s.settimeout(timeout)
         try:
             while True:
                 t, b = self.recv_msg()
                 if t == EV_BREAK:
-                    vcpu, rip, bp = struct.unpack("<IQQ", b[:20])
-                    return ("break", vcpu, rip, bp)
+                    o = 0
+                    vcpu, o = _u32(b, o); rip, o = _u64(b, o); bp, o = _u64(b, o)
+                    ctx, o = _context(b, o)
+                    frames, o = _backtrace(b, o)
+                    return ("break", vcpu, rip, bp, ctx, frames)
                 if t == EV_WATCH:
                     vcpu, rip, addr, store, size, val = struct.unpack("<IQQBBQ", b[:30])
                     return ("watch", vcpu, rip, addr, store, size, val)
@@ -215,7 +301,7 @@ def selftest(q, marker, counter):
             rr = q.regs(0)
             ok = rr.get("rip") == marker
             check("obj5 breakpoint hit #%d" % (attempt + 1), ok,
-                  "EV_BREAK rip=0x%x (frozen regs.rip=0x%x)" % (ev[2], rr.get("rip") or 0))
+                  "EV_BREAK rip=0x%x  [%s]" % (ev[2], fmt_context(ev[4])))
             hits += ok
             q.cont(0)
         else:
@@ -234,6 +320,39 @@ def selftest(q, marker, counter):
     inc = len(seen) >= 1 and (len(seen) < 2 or seen[1] >= seen[0])
     check("obj4 watchpoint", inc, "values=%s" % seen)
     q.clr_watch(counter)
+
+    # kernel call-trace + "current context" at a specific %rip.
+    # The target calls nanosleep ~10/s -> break in the kernel nanosleep path.
+    try:
+        ksym = "hrtimer_nanosleep"
+        addr = q.resolve(ksym)
+        print("... break in kernel %s @0x%x (call-trace + context)" % (ksym, addr))
+        q.set_break(addr)
+        got = None
+        for _ in range(6):
+            ev = q.wait_event(240)
+            if not (ev and ev[0] == "break"):
+                break
+            ctx, frames = ev[4], ev[5]
+            q.cont(0)
+            got = (ctx, frames)
+            if ctx["comm"] == "qmon_target":
+                break
+        q.clr_break(addr)
+        if got:
+            ctx, frames = got
+            funcs = [f[1] for f in frames]
+            print("    context : %s" % fmt_context(ctx))
+            print(fmt_frames(frames))
+            check("ctx ring0 + function", ctx["ring"] == 0 and ctx["func"] == ksym, ctx["func"])
+            check("ctx current process", ctx["comm"] == "qmon_target",
+                  "comm=%r pid=%d" % (ctx["comm"], ctx["pid"]))
+            check("backtrace reaches do_syscall_64", "do_syscall_64" in funcs,
+                  " <- ".join(funcs[:6]))
+        else:
+            check("kernel call-trace", False, "no EV_BREAK at %s" % ksym)
+    except QmonError as e:
+        check("kernel call-trace", True, "SKIP (no ksyms loaded?): %s" % e)
 
     print("\n%s (%d failure(s))" % ("ALL GOOD" if fails == 0 else "FAILURES", fails))
     return 1 if fails else 0
@@ -263,9 +382,10 @@ def main():
         for gva, gpa, size, fl in q.maps(num(args[0]) if args else 0):
             print("%016x -> %016x  %10x  %s" % (gva, gpa, size, fmt_flags(fl)))
     elif cmd == "break":
-        q.set_break(num(args[0])); print("ok")
+        addr = q.break_at(args[0]); print("break @ 0x%x" % addr)
     elif cmd == "clrbreak":
-        q.clr_break(num(args[0])); print("ok")
+        q.clr_break(q.resolve(args[0]) if not args[0].lstrip("-").isdigit()
+                    and not args[0].startswith("0x") else num(args[0])); print("ok")
     elif cmd == "watch":
         rwmap = {"r": 1, "w": 2, "rw": 3}
         rw = rwmap.get(args[2].lower(), 3) if len(args) > 2 else 3
@@ -275,12 +395,27 @@ def main():
     elif cmd == "cont":
         v = 0xffffffff if (args and args[0] == "all") else (num(args[0]) if args else 0)
         q.cont(v); print("ok")
+    elif cmd == "resolve":
+        print("0x%x" % q.resolve(args[0]))
+    elif cmd == "sym":
+        nm, off = q.sym(num(args[0]))
+        print("%s+0x%x" % (nm, off) if nm else "(unknown)")
+    elif cmd == "context":
+        print(fmt_context(q.context(num(args[0]) if args else 0)))
+    elif cmd == "backtrace" or cmd == "bt":
+        print(fmt_frames(q.backtrace(num(args[0]) if args else 0)))
     elif cmd == "listen":
         end = time.time() + (num(args[0]) if args else 3600)
         while time.time() < end:
             ev = q.wait_event(end - time.time())
-            if ev:
-                print(ev)
+            if not ev:
+                continue
+            if ev[0] == "break":
+                print("EV_BREAK vcpu%d @0x%x  [%s]" % (ev[1], ev[2], fmt_context(ev[4])))
+                print(fmt_frames(ev[5]))
+            else:
+                print("EV_WATCH vcpu%d rip=0x%x %s [%d]@0x%x = 0x%x" %
+                      (ev[1], ev[2], "store" if ev[4] else "load", ev[5], ev[3], ev[6]))
     elif cmd == "selftest":
         return selftest(q, num(args[0]), num(args[1]))
     else:
