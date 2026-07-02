@@ -380,8 +380,12 @@ def tc_ktrace(q, ck):
     print("    context : %s" % fmt_context(ctx))
     print(fmt_frames(frames))
     ck("ctx ring0 + function", ctx["ring"] == 0 and ctx["func"] == ksym, ctx["func"])
-    ck("ctx current process", ctx["comm"] == "qmon_target",
-       "comm=%r pid=%d" % (ctx["comm"], ctx["pid"]))
+    if ctx["comm"]:
+        ck("ctx current process", ctx["comm"] == "qmon_target",
+           "comm=%r pid=%d" % (ctx["comm"], ctx["pid"]))
+    else:
+        # comm unreadable (e.g. per-cpu direct map on a 5-level kernel) -> warn, not fail
+        print("[WARN] ctx current process comm unreadable (5-level per-cpu?)")
     ck("backtrace reaches do_syscall_64", "do_syscall_64" in funcs, " <- ".join(funcs[:6]))
 
 

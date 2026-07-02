@@ -22,6 +22,7 @@
  * (no torn reads, env fully synced).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
+ * 
  */
 
 #include <errno.h>
@@ -312,6 +313,10 @@ static _Atomic int g_calibrated;    /* 1 once g_text_slide is known/valid */
 static _Atomic unsigned long g_tick;   /* TB counter, throttles calibration */
 static bool     g_slide_forced;     /* slide= passed -> skip auto-detection */
 static uint64_t g_stext, g_etext;   /* link-time text bounds (0 if unknown) */
+static uint64_t g_orc_ip_link;      /* link-time __start_orc_unwind_ip */
+static uint64_t g_orc_link;         /* link-time __start_orc_unwind */
+static size_t   g_orc_n;            /* number of ORC entries */
+static bool     g_orc_ok;           /* kernel exposes ORC unwind tables */
 static uint64_t g_current_off;      /* per-cpu offset of current_task */
 static bool     g_have_current;
 static long     g_comm_off = -1;    /* offsetof(task_struct, comm) */
@@ -394,8 +399,29 @@ static void ksyms_load(const char *path)
 
     if (!ksym_value("_stext", &g_stext)) { (void)ksym_value("_text", &g_stext); }
     (void)ksym_value("_etext", &g_etext);
+    /* current_task is per-CPU: its offset within the per-CPU area is its
+     * System.map value minus __per_cpu_start (which is 0 on kernels that link
+     * the percpu section at 0, e.g. 5.15, but non-zero on newer kernels). */
     g_have_current = ksym_value("current_task", &g_current_off);
+    if (g_have_current) {
+        uint64_t pcpu_start;
+        if (ksym_value("__per_cpu_start", &pcpu_start)) {
+            g_current_off -= pcpu_start;
+        }
+    }
     (void)ksym_value("linux_banner", &g_anchor_va);   /* KASLR slide anchor */
+
+    /* ORC unwind tables (CONFIG_UNWINDER_ORC): if present, prefer ORC over the
+     * frame-pointer chain for kernel backtraces. */
+    uint64_t oip, oip_stop, orc;
+    if (ksym_value("__start_orc_unwind_ip", &oip) &&
+        ksym_value("__stop_orc_unwind_ip", &oip_stop) &&
+        ksym_value("__start_orc_unwind", &orc) && oip_stop > oip) {
+        g_orc_ip_link = oip;
+        g_orc_link = orc;
+        g_orc_n = (size_t)((oip_stop - oip) / 4);
+        g_orc_ok = true;
+    }
 
     char msg[200];
     g_snprintf(msg, sizeof(msg),
@@ -495,6 +521,14 @@ static bool gmem_u64(uint64_t va, uint64_t *out)
     return true;
 }
 
+static bool gmem_s32(uint64_t va, int32_t *out)
+{
+    uint8_t t[4];
+    if (!gmem_read(va, t, 4)) { return false; }
+    *out = (int32_t)le32dec(t);
+    return true;
+}
+
 /* sym = u8 namelen, name, u64 offset (or namelen 0 + raw addr if unknown).
  * Only addresses inside kernel text are named (avoids attributing a user or
  * data address to the nearest kernel symbol). When text bounds are unknown,
@@ -571,19 +605,10 @@ static void build_context(GByteArray *out)
     if (commlen) { g_byte_array_append(out, (const uint8_t *)comm, commlen); }
 }
 
-/* backtrace blob; frame-pointer (RBP) chain; vCPU thread + R_REGS */
-static void build_backtrace(GByteArray *out, uint32_t max)
+/* frame-pointer (RBP) chain unwinder (CONFIG_FRAME_POINTER kernels) */
+static void backtrace_fp(GArray *fr, uint64_t rip, uint64_t rsp, uint64_t rbp,
+                         uint32_t max)
 {
-    try_calibrate_slide();
-    if (max == 0 || max > QMON_MAX_FRAMES) { max = QMON_MAX_FRAMES; }
-    uint64_t rip = 0, rsp = 0, rbp = 0;
-    read_reg_u64("rip", &rip);
-    read_reg_u64("rsp", &rsp);
-    read_reg_u64("rbp", &rbp);
-
-    GArray *fr = g_array_new(FALSE, FALSE, sizeof(uint64_t));
-    g_array_append_val(fr, rip);
-
     uint64_t top = (rsp | (QMON_THREAD_SIZE - 1)) + 1;
 
     /* function-entry heuristic: caller's return addr is freshly at *rsp */
@@ -602,6 +627,142 @@ static void build_backtrace(GByteArray *out, uint32_t max)
         g_array_append_val(fr, ret);
         if (nxt <= cur) { break; }
         cur = nxt;
+    }
+}
+
+/* ORC unwinder (CONFIG_UNWINDER_ORC) -- mirrors arch/x86/kernel/unwind_orc.c. */
+enum {                                       /* arch/x86/include/asm/orc_types.h */
+    ORC_REG_UNDEFINED = 0, ORC_REG_AX, ORC_REG_DX, ORC_REG_SP, ORC_REG_BP,
+    ORC_REG_DI, ORC_REG_R10, ORC_REG_R13, ORC_REG_PREV_SP,
+    ORC_REG_SP_INDIRECT, ORC_REG_BP_INDIRECT,
+};
+enum {
+    ORC_TYPE_UNDEFINED = 0, ORC_TYPE_END_OF_STACK, ORC_TYPE_CALL,
+    ORC_TYPE_REGS, ORC_TYPE_REGS_PARTIAL,
+};
+#define ORC_PTREGS_IP  128       /* offsetof(struct pt_regs, ip)  (x86_64) */
+#define ORC_PTREGS_SP  152       /* offsetof(struct pt_regs, sp)  (x86_64) */
+#define ORC_IRET_OFF   128       /* IRET_FRAME_OFFSET = offsetof(pt_regs, ip) */
+
+typedef struct {
+    int16_t sp_offset, bp_offset;
+    uint8_t sp_reg, bp_reg, type, sig;
+    bool found;
+} OrcEntry;
+
+/* Binary-search the self-relative ip table (in guest memory) for the rightmost
+ * entry whose code address is <= ip, and decode its 6-byte orc_entry. */
+static OrcEntry orc_find(uint64_t ip)
+{
+    OrcEntry e = {0};
+    if (!g_orc_ok || g_orc_n == 0) { return e; }
+    uint64_t ip_rt = g_orc_ip_link + g_text_slide;
+    uint64_t orc_rt = g_orc_link + g_text_slide;
+    long lo = 0, hi = (long)g_orc_n - 1, found = -1;
+    while (lo <= hi) {
+        long mid = lo + (hi - lo) / 2;
+        uint64_t slot = ip_rt + (uint64_t)mid * 4;
+        int32_t rel;
+        if (!gmem_s32(slot, &rel)) { return e; }
+        uint64_t orc_ip = slot + (int64_t)rel;      /* entries are self-relative */
+        if (orc_ip <= ip) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    if (found < 0) { return e; }
+    uint8_t b[6];
+    if (!gmem_read(orc_rt + (uint64_t)found * 6, b, 6)) { return e; }
+    e.sp_offset = (int16_t)(b[0] | (b[1] << 8));
+    e.bp_offset = (int16_t)(b[2] | (b[3] << 8));
+    uint16_t f = (uint16_t)(b[4] | (b[5] << 8));
+    e.sp_reg = f & 0xf;
+    e.bp_reg = (f >> 4) & 0xf;
+    e.type   = (f >> 8) & 0x7;
+    e.sig    = (f >> 11) & 0x1;
+    e.found  = true;
+    return e;
+}
+
+static void backtrace_orc(GArray *fr, uint64_t rip, uint64_t rsp, uint64_t rbp,
+                          uint32_t max)
+{
+    uint64_t ip = rip, sp = rsp, bp = rbp;
+    bool sig = true;              /* breakpoint ip is "current" (like a regs frame) */
+
+    while ((uint32_t)fr->len < max) {
+        OrcEntry e = orc_find(sig ? ip : ip - 1);
+        if (!e.found || e.type == ORC_TYPE_UNDEFINED ||
+            e.type == ORC_TYPE_END_OF_STACK) {
+            break;
+        }
+        sig = e.sig;
+
+        /* previous frame's stack pointer (CFA) */
+        uint64_t cfa;
+        bool indirect = false;
+        switch (e.sp_reg) {
+        case ORC_REG_SP:          cfa = sp + e.sp_offset; break;
+        case ORC_REG_BP:          cfa = bp + e.sp_offset; break;
+        case ORC_REG_SP_INDIRECT: cfa = sp; indirect = true; break;
+        case ORC_REG_BP_INDIRECT: cfa = bp + e.sp_offset; indirect = true; break;
+        default: return;          /* AX/DX/DI/R10/R13 need regs -> stop cleanly */
+        }
+        if (indirect) {
+            uint64_t v;
+            if (!gmem_u64(cfa, &v)) { return; }
+            cfa = v;
+            if (e.sp_reg == ORC_REG_SP_INDIRECT) { cfa += e.sp_offset; }
+        }
+
+        uint64_t prev_sp = sp;
+        switch (e.type) {
+        case ORC_TYPE_CALL: {
+            uint64_t r;
+            if (!gmem_u64(cfa - 8, &r)) { return; }
+            ip = r; sp = cfa;
+            break;
+        }
+        case ORC_TYPE_REGS:                       /* full pt_regs at cfa */
+            if (!gmem_u64(cfa + ORC_PTREGS_IP, &ip) ||
+                !gmem_u64(cfa + ORC_PTREGS_SP, &sp)) { return; }
+            break;
+        case ORC_TYPE_REGS_PARTIAL: {             /* iret regs at cfa - IRET_OFF */
+            uint64_t base = cfa - ORC_IRET_OFF;
+            if (!gmem_u64(base + ORC_PTREGS_IP, &ip) ||
+                !gmem_u64(base + ORC_PTREGS_SP, &sp)) { return; }
+            break;
+        }
+        default: return;
+        }
+
+        /* previous frame's BP */
+        switch (e.bp_reg) {
+        case ORC_REG_PREV_SP: { uint64_t v; if (gmem_u64(cfa + e.bp_offset, &v)) { bp = v; } break; }
+        case ORC_REG_BP:      { uint64_t v; if (gmem_u64(bp + e.bp_offset, &v)) { bp = v; } break; }
+        default: break;       /* UNDEFINED: keep bp */
+        }
+
+        if (!is_ktext(ip)) { break; }             /* left kernel text (user boundary) */
+        if (sp <= prev_sp) { break; }             /* loop prevention */
+        g_array_append_val(fr, ip);
+    }
+}
+
+/* backtrace blob; ORC when the kernel exposes ORC tables, else RBP chain.
+ * vCPU thread + R_REGS. */
+static void build_backtrace(GByteArray *out, uint32_t max)
+{
+    try_calibrate_slide();
+    if (max == 0 || max > QMON_MAX_FRAMES) { max = QMON_MAX_FRAMES; }
+    uint64_t rip = 0, rsp = 0, rbp = 0;
+    read_reg_u64("rip", &rip);
+    read_reg_u64("rsp", &rsp);
+    read_reg_u64("rbp", &rbp);
+
+    GArray *fr = g_array_new(FALSE, FALSE, sizeof(uint64_t));
+    g_array_append_val(fr, rip);
+    if (g_orc_ok) {
+        backtrace_orc(fr, rip, rsp, rbp, max);
+    } else {
+        backtrace_fp(fr, rip, rsp, rbp, max);
     }
 
     p32(out, fr->len);

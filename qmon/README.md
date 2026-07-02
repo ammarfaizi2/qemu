@@ -142,8 +142,10 @@ addresses and, at any stop, reports:
 - **function** — the symbol the RIP is in (only addresses in `[_stext,_etext)` are named);
 - **process** — the current task's `comm` + `pid`, read from the per-CPU `current_task`
   (`gs_base`/`kernel_gs_base + offset`) using `task_struct` offsets parsed from BTF;
-- **call trace** — an exact **frame-pointer (RBP) chain** unwind, each return address
-  symbolized, with a function-entry heuristic (`*rsp`) for the immediate caller.
+- **call trace** — a symbolized stack unwind, **auto-selecting the unwinder**: if the kernel
+  exposes ORC tables (`CONFIG_UNWINDER_ORC`, frame pointers off — most stock kernels) qmon
+  reads `__start_orc_unwind{,_ip}` from guest memory and unwinds via ORC; otherwise it walks
+  the **frame-pointer (RBP) chain**. Both work with no user change.
 
 This is built inside `EV_BREAK` (self-describing hits) and also available on demand via
 `CONTEXT` / `BACKTRACE`. Example, breaking in the nanosleep path:
@@ -165,9 +167,11 @@ cost, and is one-shot. Query it with `client.py <sock> slide`; force a value or 
 detection with `slide=0x…`. So `nokaslr` is **not** required. (The per-CPU `current_task`
 and `gs_base` are not text-slid, so the process readout is unaffected.)
 
-Requirements/assumptions: the kernel is built with `CONFIG_FRAME_POINTER=y` (exact RBP
-unwind; an ORC-only kernel would need a different unwinder). The `System.map`/BTF must
+Requirements/assumptions: the kernel uses either ORC (`CONFIG_UNWINDER_ORC`) or frame
+pointers (`CONFIG_FRAME_POINTER`) — qmon picks automatically. The `System.map`/BTF must
 match the running kernel, and `System.map` must contain `linux_banner` for auto-slide.
+`tests/orc/` builds a small ORC kernel (`build-orc-kernel.sh`) and verifies the ORC path
+(`make test-orc`).
 
 ## Test suite (`tests/`)
 
@@ -204,8 +208,13 @@ connection.
   halted, a read returns a timeout error after ~2 s rather than hanging.
 - **`LIST_MAP`** targets x86_64 long mode and needs `cr3` in the gdb register set; if it
   isn't exposed it returns a clear error.
-- **Call trace** needs `CONFIG_FRAME_POINTER` and a matching `System.map`; on an ORC-only
-  kernel the RBP unwind degrades (future work: ORC / heuristic scan).
+- **Current process** (`comm`/`pid`) is read from the per-CPU `current_task`. On 5-level
+  (LA57) kernels the per-CPU direct-map region isn't reachable via the plugin memory API
+  here, so `comm`/`pid` may be blank (the call trace and everything else still work); it
+  works on 4-level kernels. `x86_64` only.
+- **Call trace** needs ORC (`CONFIG_UNWINDER_ORC`) or `CONFIG_FRAME_POINTER`, and a matching
+  `System.map`. ORC coverage is the vmlinux table (no modules / BPF-JIT / ftrace-trampolines
+  — the unwind stops cleanly there).
 - **KASLR** slide is auto-detected via `linux_banner` (no `nokaslr` needed); force it with
   `slide=0x…` if your `System.map` lacks that symbol.
 - **One client** connection at a time. Multi-client and a richer client are future work.

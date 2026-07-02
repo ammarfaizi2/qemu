@@ -42,9 +42,14 @@ test: all guest
 test-%: all guest
 	./tests/test_$*.sh
 
+# ORC unwinder test on a frame-pointer-less kernel (needs an ORC kernel; build
+# it once with tests/orc/build-orc-kernel.sh). Explicit rule; overrides test-%.
+test-orc: all
+	./tests/orc/test_ktrace_orc.sh
+
 verify: test          # back-compat alias
 
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all guest test verify clean
+.PHONY: all guest test test-orc verify clean

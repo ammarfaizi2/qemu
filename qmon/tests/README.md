@@ -59,6 +59,22 @@ The assertions themselves live in `../client.py` as `tc_<name>` functions, dispa
 disarm-on-disconnect behavior). `client.py <sock> test all <marker> <counter>` runs the
 whole suite in a single connection.
 
+## ORC unwinder test (`tests/orc/`)
+
+The bundled appliance kernel (5.15) uses frame pointers, so `make test` exercises the RBP
+unwinder. To test the **ORC** path (frame-pointer-less kernels, i.e. most stock kernels):
+
+```sh
+tests/orc/build-orc-kernel.sh   # one-time: builds a small ORC kernel under $ORC_DIR (/root/orc)
+make test-orc                   # boots it (PID 1 = the workload) and checks the ORC backtrace
+```
+
+`build-orc-kernel.sh` builds Linux with `CONFIG_UNWINDER_ORC=y` + frame pointers off (KASLR,
+virtio, serial) and a detached BTF. `test_ktrace_orc.sh` boots it with a minimal initramfs
+(`orc_init.c` as PID 1) and asserts the kernel call-trace reaches `do_syscall_64` **via ORC**
+(RBP chaining would fail there). It skips if the kernel artifacts are absent. Note: that
+kernel is 5-level (LA57), where `comm`/`pid` is currently unreadable (warned, not failed).
+
 ## Adding a test
 
 1. Add a `tc_<name>(q, ck, ...)` check in `../client.py` and register it in `TESTS` /
