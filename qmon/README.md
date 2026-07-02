@@ -47,6 +47,8 @@ Plugin arguments (`-plugin qmon.so,key=val,...`):
 | `sock`    | `/tmp/qmon.sock`          | unix socket path the plugin listens on                      |
 | `bp`      | `on`                      | instrument instructions for breakpoints (objective 5)       |
 | `wp`      | `on`                      | instrument memory ops for watchpoints (objective 4)         |
+| `ylang`   | `off`                     | call the ylang probe targets each block (see "ylang bridge")|
+| `ylang_lo`/`ylang_hi` | `0` / `~0`    | only fire the ylang probes when guest `%rip` is in this window |
 | `ksyms`   | (none)                    | `System.map` or kallsyms file → symbolize call traces       |
 | `slide`   | `auto`                    | KASLR text slide; `auto` detects it, or force a value        |
 | `btf`     | `/sys/kernel/btf/vmlinux` | BTF for `task_struct` `comm`/`pid` offsets (current process)|
@@ -132,6 +134,47 @@ it enqueues a command that a vCPU-thread callback executes:
   send `CONTINUE`;
 - **watchpoints** are `mem` callbacks that filter the access address; a hit emits
   `EV_WATCH` *after* the access (post-access semantics) and keeps running.
+
+## ylang bridge (`ylang=on`)
+
+Besides the unix-socket protocol, qmon can be driven with
+[OpenResty XRay](https://openresty.com/en/xray/) **ylang** — a second, "push" front
+end where each qmon command has a matching probe function. The plugin exports a small
+set of deliberately opaque no-op symbols (in `probe_ylang.c`, declared in
+`probe_ylang.h`) and *calls* them from a vCPU thread with the guest state snapshotted
+into a shared struct; an external ylang script places a **uprobe** on one by name and
+reads the argument out of the qemu process:
+
+```c
+/* trace.y */
+_probe qemu_ylang_cpu_reg_dump(struct qemu_cpu_state *cpu) {
+    printf("cpu%u rip=%#lx rsp=%#lx cs=%#lx\n",
+           cpu->cpu_index, cpu->rip, cpu->rsp, cpu->cs);
+}
+```
+
+```sh
+qemu-system-x86_64 -accel tcg -plugin qmon.so,ylang=on,ylang_lo=0x401000,ylang_hi=0x401000 ...
+run-y -p "$(pidof qemu-system-x86_64)" trace.y      # dumps guest regs at %rip 0x401000
+```
+
+Current probe targets (one per command is the goal; more to come):
+
+| probe target                | command | argument                |
+|-----------------------------|---------|-------------------------|
+| `qemu_ylang_cpu_reg_dump`   | `READ_REGS` | `struct qemu_cpu_state *` |
+
+The shared structs live in **`qmon_ylang.h`**, kept byte-identical to
+**`ylang/qmon_ylang.y`** (the C producer and the ylang consumer must agree on the
+layout). Because ylang's stap+ backend reads only **flat, named scalar** struct
+fields — not arrays or nested structs — `qemu_cpu_state` is a flat list of
+`uint64_t` registers rather than arrays.
+
+Calling the probe every block is expensive (a full register read-out, and a uprobe
+trap when a script is attached), so `ylang=on` is **off by default** and
+`ylang_lo`/`ylang_hi` gate the call to a `%rip` window — the plugin-side analogue of
+a breakpoint address. With no window set, the probe fires on every block. See
+`tests/test_ylang_cpu_reg_dump.sh` (`make test-ylang`).
 
 ## Kernel call trace & "current context"
 

@@ -75,6 +75,24 @@ virtio, serial) and a detached BTF. `test_ktrace_orc.sh` boots it with a minimal
 (RBP chaining would fail there). It skips if the kernel artifacts are absent. Note: that
 kernel is 5-level (LA57), where `comm`/`pid` is currently unreadable (warned, not failed).
 
+## ylang bridge test (`test_ylang_cpu_reg_dump.sh`)
+
+```sh
+make test-ylang       # or: ./tests/test_ylang_cpu_reg_dump.sh
+```
+
+Exercises the **ylang** front end (see the plugin README): boots the appliance with
+`ylang=on` and a `%rip` pre-filter pinned to `marker()`, forks `run-y` to place a uprobe
+on the plugin's `qemu_ylang_cpu_reg_dump` symbol in the running qemu process, and checks
+the dumped guest registers were captured at `marker()` (`rip == 0x401000`). Boots its own
+guest (it needs the qemu PID, so it is **not** part of `make test`'s shared-guest run).
+
+Requires the OpenResty XRay CLI (`run-y`) and network access to its build-box/agent; it
+**skips** cleanly if `run-y` is absent. `run-y` compiles the probe remotely, so the first
+run is slow (it uploads qemu's debuginfo; cached afterwards). The ylang script reuses the
+shared `struct qemu_cpu_state` by extracting it from `../ylang/qmon_ylang.y`, so it can't
+drift from the plugin.
+
 ## Adding a test
 
 1. Add a `tc_<name>(q, ck, ...)` check in `../client.py` and register it in `TESTS` /
