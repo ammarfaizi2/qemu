@@ -41,6 +41,8 @@
 #include <glib.h>
 #include <qemu-plugin.h>
 
+#include "probe_ylang.h"
+
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
 /* ------------------------------------------------------------------ */
@@ -185,6 +187,18 @@ static qemu_plugin_id_t g_id;
 static bool feat_bp = true;     /* instrument insns for breakpoints */
 static bool feat_wp = true;     /* instrument mem ops for watchpoints */
 
+/*
+ * ylang bridge (objective: one probe target per command).  When on, the per-TB
+ * pump snapshots the guest registers and hands them to qemu_ylang_cpu_reg_dump()
+ * so an external ylang uprobe can observe them.  Off by default (it adds a
+ * register read-out per block).  ylang_lo/ylang_hi optionally gate the call to a
+ * %rip window - the plugin-side analogue of a breakpoint address - so neither
+ * the fill nor the uprobe fires for every block; unset means "every block".
+ */
+static bool     feat_ylang;
+static uint64_t g_ylang_lo;
+static uint64_t g_ylang_hi = UINT64_MAX;
+
 typedef struct {
     uint64_t addr;
     uint64_t len;
@@ -272,21 +286,29 @@ static struct qemu_plugin_register *find_reg(const char *name)
     return NULL;
 }
 
+/* read a register as a little-endian u64 into a caller-provided buffer (reused
+ * across many reads to avoid a per-register allocation on the hot path) */
+static bool read_reg_into(GByteArray *b, const char *name, uint64_t *out)
+{
+    *out = 0;
+    struct qemu_plugin_register *h = find_reg(name);
+    if (!h) { return false; }
+    g_byte_array_set_size(b, 0);
+    if (!qemu_plugin_read_register(h, b)) { return false; }
+    uint64_t v = 0;
+    for (guint i = 0; i < b->len && i < 8; i++) {
+        v |= (uint64_t)b->data[i] << (8 * i);
+    }
+    *out = v;
+    return true;
+}
+
 /* read a register as a little-endian u64 (x86 control/general regs) */
 static bool read_reg_u64(const char *name, uint64_t *out)
 {
-    struct qemu_plugin_register *h = find_reg(name);
-    if (!h) { return false; }
     GByteArray *b = g_byte_array_new();
-    bool ok = qemu_plugin_read_register(h, b);
-    uint64_t v = 0;
-    if (ok) {
-        for (guint i = 0; i < b->len && i < 8; i++) {
-            v |= (uint64_t)b->data[i] << (8 * i);
-        }
-    }
+    bool ok = read_reg_into(b, name, out);
     g_byte_array_free(b, TRUE);
-    *out = v;
     return ok;
 }
 
@@ -1058,6 +1080,45 @@ static void block_until_continue(unsigned vcpu)
 }
 
 /* ------------------------------------------------------------------ */
+/* ylang bridge (objective 1: CPU register dump)                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Snapshot the current vCPU's registers into a qemu_cpu_state and hand it to the
+ * ylang probe target.  Runs on the vCPU thread with R_REGS, so the read-out is
+ * a consistent, TB-boundary snapshot.  QEMU's x86 gdb register set exposes
+ * rax..r15, rip, eflags, the six segment selectors and cr0-cr4 (no APX eGPRs,
+ * MSRs or debug regs); anything absent stays zero.
+ */
+static void ylang_emit_cpu_regs(unsigned int vcpu)
+{
+    struct qemu_cpu_state st;
+    memset(&st, 0, sizeof(st));
+    st.cpu_index = vcpu;
+
+    /* Map each flat field to its gdb register name; missing regs stay zero
+     * (e.g. the APX eGPRs r16-r31 aren't in QEMU's x86 gdb set). */
+    const struct { const char *nm; uint64_t *p; } map[] = {
+        { "rax", &st.rax }, { "rcx", &st.rcx }, { "rdx", &st.rdx }, { "rbx", &st.rbx },
+        { "rsp", &st.rsp }, { "rbp", &st.rbp }, { "rsi", &st.rsi }, { "rdi", &st.rdi },
+        { "r8",  &st.r8  }, { "r9",  &st.r9  }, { "r10", &st.r10 }, { "r11", &st.r11 },
+        { "r12", &st.r12 }, { "r13", &st.r13 }, { "r14", &st.r14 }, { "r15", &st.r15 },
+        { "rip", &st.rip }, { "eflags", &st.eflags },
+        { "es",  &st.es  }, { "cs",  &st.cs  }, { "ss",  &st.ss  },
+        { "ds",  &st.ds  }, { "fs",  &st.fs  }, { "gs",  &st.gs  },
+        { "cr0", &st.cr0 }, { "cr2", &st.cr2 }, { "cr3", &st.cr3 },
+        { "cr4", &st.cr4 }, { "cr8", &st.cr8 },
+    };
+    GByteArray *b = g_byte_array_new();
+    for (size_t i = 0; i < G_N_ELEMENTS(map); i++) {
+        read_reg_into(b, map[i].nm, map[i].p);
+    }
+    g_byte_array_free(b, TRUE);
+
+    qemu_ylang_cpu_reg_dump(&st);
+}
+
+/* ------------------------------------------------------------------ */
 /* instrumentation callbacks (vCPU threads)                            */
 /* ------------------------------------------------------------------ */
 
@@ -1068,6 +1129,15 @@ static void pump_cb(unsigned int vcpu, void *udata)
     if (!atomic_load(&g_calibrated) && !g_slide_forced && g_anchor_va &&
         (atomic_fetch_add(&g_tick, 1) & 0x3fff) == 0) {
         try_calibrate_slide();
+    }
+    if (feat_ylang) {
+        /* Cheap %rip pre-filter: read one register and only snapshot the full
+         * set (and fire the uprobe) when rip is in the configured window. */
+        uint64_t rip = 0;
+        read_reg_u64("rip", &rip);
+        if (rip >= g_ylang_lo && rip <= g_ylang_hi) {
+            ylang_emit_cpu_regs(vcpu);
+        }
     }
     if (atomic_load(&pending)) {
         service_one(vcpu);
@@ -1428,6 +1498,12 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             qemu_plugin_bool_parse("bp", kv[1], &feat_bp);
         } else if (g_strcmp0(kv[0], "wp") == 0 && kv[1]) {
             qemu_plugin_bool_parse("wp", kv[1], &feat_wp);
+        } else if (g_strcmp0(kv[0], "ylang") == 0 && kv[1]) {
+            qemu_plugin_bool_parse("ylang", kv[1], &feat_ylang);
+        } else if (g_strcmp0(kv[0], "ylang_lo") == 0 && kv[1]) {
+            g_ylang_lo = g_ascii_strtoull(kv[1], NULL, 0);
+        } else if (g_strcmp0(kv[0], "ylang_hi") == 0 && kv[1]) {
+            g_ylang_hi = g_ascii_strtoull(kv[1], NULL, 0);
         } else if (g_strcmp0(kv[0], "ksyms") == 0 && kv[1]) {
             g_free(g_ksyms_path); g_ksyms_path = g_strdup(kv[1]);
         } else if (g_strcmp0(kv[0], "btf") == 0 && kv[1]) {

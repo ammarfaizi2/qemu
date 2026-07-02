@@ -21,12 +21,14 @@ CFLAGS  ?= -O2 -g -Wall -Wextra
 CFLAGS  += -std=gnu11 -fPIC -fvisibility=hidden -pthread -I$(PLUGIN_INC) $(GLIB_CFLAGS)
 
 TARGET  := qmon.so
+SRCS    := qmon.c probe_ylang.c
+HDRS    := qmon_ylang.h probe_ylang.h
 GUEST   := $(QEMU_ROOT)/000_run/root/qmon_target
 
 all: $(TARGET)
 
-$(TARGET): qmon.c
-	$(CC) $(CFLAGS) $< -o $@ -shared $(GLIB_LIBS) -pthread
+$(TARGET): $(SRCS) $(HDRS)
+	$(CC) $(CFLAGS) $(SRCS) -o $@ -shared $(GLIB_LIBS) -pthread
 
 # Freestanding, fixed-VA guest workload used only for verification.
 guest: $(GUEST)
@@ -47,9 +49,15 @@ test-%: all guest
 test-orc: all
 	./tests/orc/test_ktrace_orc.sh
 
+# ylang bridge test: boot with ylang=on and uprobe qemu_ylang_cpu_reg_dump()
+# from an external ylang script (needs the OpenResty XRay CLI `run-y`; skips if
+# absent). Explicit rule; overrides test-%.
+test-ylang: all guest
+	./tests/test_ylang_cpu_reg_dump.sh
+
 verify: test          # back-compat alias
 
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all guest test test-orc verify clean
+.PHONY: all guest test test-orc test-ylang verify clean
