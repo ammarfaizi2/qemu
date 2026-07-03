@@ -55,9 +55,16 @@ test-orc: all
 test-ylang: all guest
 	./tests/test_ylang_cpu_reg_dump.sh
 
+# Runtime ylang control over the socket, observed via run-y -p. These boot their
+# own guest by default, or attach to a running qemu: `make test-ylang-enable ARGS='PID SOCK'`.
+test-ylang-enable: all guest
+	./tests/qemu_pid_ylang_enable.sh $(ARGS)
+test-ylang-window: all guest
+	./tests/qemu_pid_ylang_window.sh $(ARGS)
+
 verify: test          # back-compat alias
 
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all guest test test-orc test-ylang verify clean
+.PHONY: all guest test test-orc test-ylang test-ylang-enable test-ylang-window verify clean

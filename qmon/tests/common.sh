@@ -28,11 +28,16 @@ qmon_build() {
     make -C "$QMON_DIR" all guest >/dev/null || { echo "FAIL: build"; exit 1; }
 }
 
-# Fixed VAs of the freestanding guest workload -> MARKER / COUNTER.
+# Fixed VAs of the freestanding guest workload -> MARKER / COUNTER.  Normalised
+# to the minimal 0x form (printf %#lx, no leading zeros) so they compare equal to
+# the addresses the ylang probe prints.
 qmon_symbols() {
-    MARKER="0x$(nm "$TARGET" | awk '$3=="marker"{print $1}')"
-    COUNTER="0x$(nm "$TARGET" | awk '$3=="g_counter"{print $1}')"
-    [ "$MARKER" != "0x" ] && [ "$COUNTER" != "0x" ] || { echo "FAIL: no symbols"; exit 1; }
+    local m c
+    m="$(nm "$TARGET" | awk '$3=="marker"{print $1}')"
+    c="$(nm "$TARGET" | awk '$3=="g_counter"{print $1}')"
+    [ -n "$m" ] && [ -n "$c" ] || { echo "FAIL: no symbols"; exit 1; }
+    MARKER="$(printf '0x%x' "0x$m")"
+    COUNTER="$(printf '0x%x' "0x$c")"
 }
 
 # Inject the (freshly built) workload into the appliance image.
@@ -103,3 +108,71 @@ qmon_begin() {
 run_check() {
     python3 "$CLIENT" "$SOCK" test "$@"
 }
+
+# --- ylang / run-y helpers (used by the qemu_pid_ylang_* tests) --------------
+
+# Entry point for the pid-style ylang tests: attach to a running qemu when a PID
+# and socket are supplied ($1/$2 or QMON_QPID/QMON_SOCK), else boot our own guest.
+# Always builds the workload so MARKER/COUNTER are available.  Sets QPID + SOCK.
+qmon_pid_begin() {
+    qmon_build
+    qmon_symbols
+    local pid="${1:-${QMON_QPID:-}}" sock="${2:-${QMON_SOCK:-}}"
+    if [ -n "$pid" ] && [ -n "$sock" ]; then
+        QPID="$pid"; SOCK="$sock"; QMON_OWNED=0
+        kill -0 "$QPID" 2>/dev/null || { echo "FAIL: pid $QPID not running"; exit 1; }
+        [ -S "$SOCK" ] || { echo "FAIL: $SOCK is not a socket"; exit 1; }
+        echo "== attaching to running qemu pid=$QPID sock=$SOCK =="
+    else
+        qmon_repack
+        qmon_boot          # boots with ylang OFF (no ylang in QMON_PLUGIN_ARGS)
+    fi
+}
+
+# Send a qmon command over the control socket, e.g. qmon_cli ylang-enable on.
+qmon_cli() { python3 "$CLIENT" "$SOCK" "$@"; }
+
+# Write the shared cpu_reg_dump probe to $1, reusing the qemu_cpu_state layout
+# from ylang/qmon_ylang.y so the probe can never drift from the plugin.
+qmon_ylang_reg_probe() {
+    {
+        awk '/^struct qemu_cpu_state \{/,/^\};/' "$QMON_DIR/ylang/qmon_ylang.y"
+        cat <<'EOF'
+
+_probe qemu_ylang_cpu_reg_dump(struct qemu_cpu_state *cpu) {
+    printf("YLANG_REGDUMP cpu=%u rip=%#lx rax=%#lx rsp=%#lx rbp=%#lx cs=%#lx cr3=%#lx\n",
+           cpu->cpu_index, cpu->rip, cpu->rax, cpu->rsp, cpu->rbp, cpu->cs, cpu->cr3);
+}
+EOF
+    } > "$1"
+}
+
+# Fork run-y on the qemu pid, tracing script $1, output to $2.  Sets RUNY_PID.
+qmon_runy_start() {
+    timeout "${RUNY_TIMEOUT:-320}" run-y -p "$QPID" "$1" >"$2" 2>&1 &
+    RUNY_PID=$!
+}
+qmon_runy_stop() { kill "${RUNY_PID:-0}" 2>/dev/null; wait "${RUNY_PID:-0}" 2>/dev/null; }
+
+# True if run-y hit a terminal error (benign "cannot find this debug file"
+# warnings for stripped system libs are NOT terminal).
+qmon_runy_failed() {
+    grep -qE "status: errored|failed to compile the ylang script" "$1" 2>/dev/null
+}
+
+# Poll file $1 for ERE pattern $2 for up to $3 seconds; abort early on a run-y
+# terminal error or exit.  Returns 0 if matched, 1 otherwise.
+qmon_wait() {
+    local f="$1" pat="$2" n="$3" i=0
+    while [ "$i" -lt "$n" ]; do
+        grep -qE "$pat" "$f" 2>/dev/null && return 0
+        qmon_runy_failed "$f" && return 1
+        kill -0 "${RUNY_PID:-0}" 2>/dev/null || return 1
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
+qmon_dump_count() { local c; c=$(grep -c "YLANG_REGDUMP" "$1" 2>/dev/null) || true; echo "${c:-0}"; }
+# The %rip of the most recent dump line (hex).
+qmon_last_rip() { grep "YLANG_REGDUMP" "$1" | tail -n1 | sed -n 's/.*rip=\(0x[0-9a-fA-F]*\).*/\1/p'; }

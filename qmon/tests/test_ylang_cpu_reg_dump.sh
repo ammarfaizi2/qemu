@@ -36,16 +36,7 @@ qmon_boot            # sets QPID + the teardown trap, injects the workload
 # it straight from ylang/qmon_ylang.y (so the test can't drift from the plugin),
 # then uprobe the plugin's probe target and print the registers.
 YDIR="$(mktemp -d)"; YSCRIPT="$YDIR/reg_dump.y"; YOUT="$YDIR/run-y.out"
-{
-    awk '/^struct qemu_cpu_state \{/,/^\};/' "$QMON_DIR/ylang/qmon_ylang.y"
-    cat <<'EOF'
-
-_probe qemu_ylang_cpu_reg_dump(struct qemu_cpu_state *cpu) {
-    printf("YLANG_REGDUMP cpu=%u rip=%#lx rax=%#lx rsp=%#lx rbp=%#lx cs=%#lx cr3=%#lx\n",
-           cpu->cpu_index, cpu->rip, cpu->rax, cpu->rsp, cpu->rbp, cpu->cs, cpu->cr3);
-}
-EOF
-} > "$YSCRIPT"
+qmon_ylang_reg_probe "$YSCRIPT"
 
 echo "== fork run-y on qemu pid $QPID (uprobe qemu_ylang_cpu_reg_dump) =="
 timeout 300 run-y -p "$QPID" "$YSCRIPT" >"$YOUT" 2>&1 &
