@@ -90,6 +90,8 @@ REQ_LIST_MAP   0x14  u32 vcpu
 REQ_CONTEXT    0x15  u32 vcpu
 REQ_BACKTRACE  0x16  u32 vcpu, u32 max_frames
 REQ_SLIDE      0x17  ()                          (-> u8 calibrated, u64 slide)
+REQ_YLANG_ENABLE 0x18  u8 on                     (enable/disable the ylang bridge)
+REQ_YLANG_WINDOW 0x19  u8 on, u64 lo, u64 hi      (on=0 -> window off / fire everywhere)
 REQ_SET_BREAK  0x20  u64 addr
 REQ_CLR_BREAK  0x21  u64 addr
 REQ_SET_WATCH  0x22  u64 addr, u64 len, u8 rw   (1=R,2=W,3=RW)
@@ -175,6 +177,26 @@ trap when a script is attached), so `ylang=on` is **off by default** and
 `ylang_lo`/`ylang_hi` gate the call to a `%rip` window — the plugin-side analogue of
 a breakpoint address. With no window set, the probe fires on every block. See
 `tests/test_ylang_cpu_reg_dump.sh` (`make test-ylang`).
+
+### Runtime control (over the socket)
+
+`ylang` and the window can also be toggled on a *running* guest via the control socket —
+the natural workflow, since the ylang consumer is an external `run-y -p <pid>`, not the
+socket client:
+
+```sh
+python3 client.py /tmp/qmon.sock ylang-window 0x401000 0x401000  # gate to one %rip
+python3 client.py /tmp/qmon.sock ylang-enable  on                # start the probe
+run-y -p "$(pidof qemu-system-x86_64)" trace.y                   # observe
+python3 client.py /tmp/qmon.sock ylang-enable  off              # stop
+python3 client.py /tmp/qmon.sock ylang-window  off             # window off (fire everywhere)
+```
+
+These map to `REQ_YLANG_ENABLE` / `REQ_YLANG_WINDOW`. Unlike breakpoints/watchpoints,
+ylang state **persists after the socket client disconnects** (it is global config whose
+consumer is `run-y`, not the connection); disable it when done, since leaving `ylang=on`
+keeps a per-block register read-out running. Verified by `tests/qemu_pid_ylang_enable.sh`
+and `tests/qemu_pid_ylang_window.sh` (`make test-ylang-enable` / `test-ylang-window`).
 
 ## Kernel call trace & "current context"
 

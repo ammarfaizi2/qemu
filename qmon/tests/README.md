@@ -93,6 +93,29 @@ run is slow (it uploads qemu's debuginfo; cached afterwards). The ylang script r
 shared `struct qemu_cpu_state` by extracting it from `../ylang/qmon_ylang.y`, so it can't
 drift from the plugin.
 
+## ylang runtime-control tests (`qemu_pid_ylang_*.sh`)
+
+```sh
+make test-ylang-enable     # toggle ylang on/off at runtime over the socket
+make test-ylang-window     # enable/disable the ylang %rip window at runtime
+make test-ylang-enable ARGS='PID SOCK'    # attach to an already-running qemu instead
+```
+
+These drive `run-y -p <pid>` while flipping the plugin's ylang state over the control
+socket (`client.py ylang-enable` / `ylang-window`), proving the toggles take effect on a
+live guest:
+
+| script                        | checks                                                            |
+|-------------------------------|-------------------------------------------------------------------|
+| `qemu_pid_ylang_enable.sh`    | ylang off ⇒ no dumps; enable ⇒ dumps at `marker()`; disable ⇒ stop |
+| `qemu_pid_ylang_window.sh`    | window on ⇒ dumps only at `marker()`; window off ⇒ dumps elsewhere |
+
+They use `common.sh`'s `qmon_pid_begin`: pass a running qemu's `PID SOCK` (args or
+`QMON_QPID`/`QMON_SOCK`) to **attach** (fast, no root), or none to **boot** a dedicated
+guest (needs root). Both `SKIP` if `run-y` is absent. The window-off step briefly fires the
+probe on every block (an intentional uprobe flood) — it just needs one non-`marker()` dump,
+then tears down.
+
 ## Adding a test
 
 1. Add a `tc_<name>(q, ck, ...)` check in `../client.py` and register it in `TESTS` /
