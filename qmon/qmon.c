@@ -62,6 +62,8 @@ enum {
     REQ_CONTEXT    = 0x15, /* u32 vcpu -> ring + sym(rip) + pid + comm */
     REQ_BACKTRACE  = 0x16, /* u32 vcpu, u32 max -> frames */
     REQ_SLIDE      = 0x17, /* () -> u8 calibrated, u64 kaslr text slide */
+    REQ_YLANG_ENABLE = 0x18, /* u8 on -> enable/disable the ylang bridge */
+    REQ_YLANG_WINDOW = 0x19, /* u8 on, u64 lo, u64 hi -> set/clear the %rip window */
     REQ_SET_BREAK  = 0x20, /* u64 addr */
     REQ_CLR_BREAK  = 0x21, /* u64 addr */
     REQ_SET_WATCH  = 0x22, /* u64 addr, u64 len, u8 rw (1=R,2=W,3=RW) */
@@ -195,9 +197,13 @@ static bool feat_wp = true;     /* instrument mem ops for watchpoints */
  * %rip window - the plugin-side analogue of a breakpoint address - so neither
  * the fill nor the uprobe fires for every block; unset means "every block".
  */
-static bool     feat_ylang;
-static uint64_t g_ylang_lo;
-static uint64_t g_ylang_hi = UINT64_MAX;
+/* Toggled at load time (args) and at runtime (REQ_YLANG_*), read on the vCPU
+ * thread in pump_cb -> atomic. The window bounds are two independent atomics; a
+ * concurrent update can momentarily mix old-lo/new-hi, which only mis-filters a
+ * single block. */
+static _Atomic bool     feat_ylang;
+static _Atomic uint64_t g_ylang_lo;
+static _Atomic uint64_t g_ylang_hi = UINT64_MAX;
 
 typedef struct {
     uint64_t addr;
@@ -1130,12 +1136,12 @@ static void pump_cb(unsigned int vcpu, void *udata)
         (atomic_fetch_add(&g_tick, 1) & 0x3fff) == 0) {
         try_calibrate_slide();
     }
-    if (feat_ylang) {
+    if (atomic_load(&feat_ylang)) {
         /* Cheap %rip pre-filter: read one register and only snapshot the full
          * set (and fire the uprobe) when rip is in the configured window. */
         uint64_t rip = 0;
         read_reg_u64("rip", &rip);
-        if (rip >= g_ylang_lo && rip <= g_ylang_hi) {
+        if (rip >= atomic_load(&g_ylang_lo) && rip <= atomic_load(&g_ylang_hi)) {
             ylang_emit_cpu_regs(vcpu);
         }
     }
@@ -1362,6 +1368,21 @@ static void handle_request(const uint8_t *buf, size_t len)
     }
     case REQ_CLR_WATCH: { uint64_t a = g64(&r); if (!r.err) { clr_wp(a); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
     case REQ_CONTINUE:  { uint32_t v = g32(&r); if (!r.err) { do_continue(v); reply_ok_empty(); } else { reply_err(3, "short"); } break; }
+    case REQ_YLANG_ENABLE: {
+        uint8_t on = g8(&r);
+        if (r.err) { reply_err(3, "short"); break; }
+        atomic_store(&feat_ylang, on != 0);
+        reply_ok_empty();
+        break;
+    }
+    case REQ_YLANG_WINDOW: {
+        uint8_t on = g8(&r); uint64_t lo = g64(&r), hi = g64(&r);
+        if (r.err) { reply_err(3, "short"); break; }
+        atomic_store(&g_ylang_lo, on ? lo : 0);
+        atomic_store(&g_ylang_hi, on ? hi : UINT64_MAX);
+        reply_ok_empty();
+        break;
+    }
     case REQ_SLIDE: {
         GByteArray *b = g_byte_array_new();
         p8(b, RSP_OK);
@@ -1499,11 +1520,13 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         } else if (g_strcmp0(kv[0], "wp") == 0 && kv[1]) {
             qemu_plugin_bool_parse("wp", kv[1], &feat_wp);
         } else if (g_strcmp0(kv[0], "ylang") == 0 && kv[1]) {
-            qemu_plugin_bool_parse("ylang", kv[1], &feat_ylang);
+            bool on = false;
+            qemu_plugin_bool_parse("ylang", kv[1], &on);
+            atomic_store(&feat_ylang, on);
         } else if (g_strcmp0(kv[0], "ylang_lo") == 0 && kv[1]) {
-            g_ylang_lo = g_ascii_strtoull(kv[1], NULL, 0);
+            atomic_store(&g_ylang_lo, g_ascii_strtoull(kv[1], NULL, 0));
         } else if (g_strcmp0(kv[0], "ylang_hi") == 0 && kv[1]) {
-            g_ylang_hi = g_ascii_strtoull(kv[1], NULL, 0);
+            atomic_store(&g_ylang_hi, g_ascii_strtoull(kv[1], NULL, 0));
         } else if (g_strcmp0(kv[0], "ksyms") == 0 && kv[1]) {
             g_free(g_ksyms_path); g_ksyms_path = g_strdup(kv[1]);
         } else if (g_strcmp0(kv[0], "btf") == 0 && kv[1]) {

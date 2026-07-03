@@ -21,6 +21,8 @@ Usage:
   client.py SOCK context [VCPU]   |  backtrace [VCPU]   # ring/func/process; call trace
   client.py SOCK resolve NAME     |  sym ADDR           # kernel symbol <-> addr
   client.py SOCK slide                              # detected KASLR text slide
+  client.py SOCK ylang-enable on|off                # toggle the ylang bridge at runtime
+  client.py SOCK ylang-window LO HI | off           # set/clear the ylang %rip window
   client.py SOCK test NAME [args]                   # ping|regs|slide|vmem|maps|watch|break|ktrace
   client.py SOCK test break MARKER_VA               # watch/break take a target VA
   client.py SOCK test all MARKER_VA COUNTER_VA      # run the whole suite (one connection)
@@ -35,6 +37,7 @@ import time
 REQ_PING, REQ_READ_REGS, REQ_READ_VMEM, REQ_READ_PMEM = 0x01, 0x10, 0x11, 0x12
 REQ_XLATE, REQ_LIST_MAP, REQ_CONTEXT, REQ_BACKTRACE = 0x13, 0x14, 0x15, 0x16
 REQ_SLIDE = 0x17
+REQ_YLANG_ENABLE, REQ_YLANG_WINDOW = 0x18, 0x19
 REQ_SET_BREAK, REQ_CLR_BREAK, REQ_SET_WATCH, REQ_CLR_WATCH = 0x20, 0x21, 0x22, 0x23
 REQ_RESOLVE, REQ_SYM, REQ_CONTINUE = 0x24, 0x25, 0x30
 # response / event types
@@ -206,6 +209,12 @@ class Qmon:
     def slide(self):
         _, b = self.request(struct.pack("<B", REQ_SLIDE))
         return bool(b[0]), struct.unpack_from("<Q", b, 1)[0]
+
+    def ylang_enable(self, on):
+        self.request(struct.pack("<BB", REQ_YLANG_ENABLE, 1 if on else 0))
+
+    def ylang_window(self, on, lo=0, hi=0):
+        self.request(struct.pack("<BBQQ", REQ_YLANG_WINDOW, 1 if on else 0, lo, hi))
 
     def context(self, vcpu=0):
         _, b = self.request(struct.pack("<BI", REQ_CONTEXT, vcpu))
@@ -464,6 +473,14 @@ def main():
     elif cmd == "slide":
         cal, s = q.slide()
         print("slide=0x%x calibrated=%s" % (s, cal))
+    elif cmd == "ylang-enable":
+        q.ylang_enable(args[0] == "on"); print("ok")
+    elif cmd == "ylang-window":
+        if args and args[0] == "off":
+            q.ylang_window(False)
+        else:
+            q.ylang_window(True, num(args[0]), num(args[1]))
+        print("ok")
     elif cmd == "resolve":
         print("0x%x" % q.resolve(args[0]))
     elif cmd == "sym":
